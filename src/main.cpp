@@ -1,3 +1,4 @@
+#include <Arduino.h>
 #include <WiFi.h>
 #include <WiFiClientSecure.h>
 #include <HTTPClient.h>
@@ -25,16 +26,15 @@ constexpr int CENTER_Y = 120;
 constexpr int RADAR_RADIUS_PX = 108;
 
 // -------------------- App behavior --------------------
-constexpr uint32_t FETCH_INTERVAL_MS = 10000;
-constexpr uint32_t BLIP_REFRESH_INTERVAL_MS = 10000;
+constexpr uint32_t FETCH_INTERVAL_MS = 1500;
+constexpr uint32_t BLIP_REFRESH_INTERVAL_MS = 1500;
 constexpr int MAX_AIRCRAFT = 80;
 constexpr int MAX_TAGS_ON_SCREEN = 18;
-constexpr int MAX_DYNAMIC_REGIONS = 160;
 constexpr int MAX_ADSB_CACHE = 96;
 constexpr uint32_t ADSB_LOOKUP_SPACING_MS = 1200;
 
 Adafruit_GC9A01A tft(PIN_TFT_CS, PIN_TFT_DC, PIN_TFT_RST);
-GFXcanvas16 baseCanvas(SCREEN_W, SCREEN_H);
+GFXcanvas16 canvas(SCREEN_W, SCREEN_H);
 Preferences prefs;
 
 struct Config {
@@ -68,9 +68,9 @@ int aircraftCount = 0;
 uint32_t lastFetchMs = 0;
 uint32_t lastBlipDrawMs = 0;
 bool wifiConnected = false;
-bool baseCanvasReady = false;
-bool staticBaseDirty = true;
+bool canvasReady = false;
 bool dynamicDirty = true;
+bool firstFrame = true;
 bool bleClientConnected = false;
 int lastHttpCode = 0;
 uint32_t successfulFetchCount = 0;
@@ -86,6 +86,9 @@ struct AdsbCacheEntry {
   String routeIata;
   bool lookedUp;
   bool hasRoute;
+  bool hasLabelAngle;
+  float currentLabelAngle;
+  float targetLabelAngle;
   uint32_t lastLookupMs;
 };
 
@@ -98,10 +101,16 @@ struct RectRegion {
   int16_t h;
 };
 
+constexpr int MAX_DYNAMIC_REGIONS = 160;
 RectRegion prevDynamicRegions[MAX_DYNAMIC_REGIONS];
 int prevDynamicRegionCount = 0;
 RectRegion currentDynamicRegions[MAX_DYNAMIC_REGIONS];
 int currentDynamicRegionCount = 0;
+
+void addCurrentRegion(int x, int y, int w, int h) {
+  if (currentDynamicRegionCount >= MAX_DYNAMIC_REGIONS) return;
+  currentDynamicRegions[currentDynamicRegionCount++] = {(int16_t)x, (int16_t)y, (int16_t)w, (int16_t)h};
+}
 
 // BLE UUIDs (custom service)
 static NimBLEUUID RADAR_SERVICE_UUID("7a0b1001-25be-45b3-8a2f-d5e9f53c1001");
@@ -117,12 +126,14 @@ static NimBLEUUID CMD_CHAR_UUID("7a0b1008-25be-45b3-8a2f-d5e9f53c1008");
 static NimBLEUUID STATUS_CHAR_UUID("7a0b1009-25be-45b3-8a2f-d5e9f53c1009");
 
 NimBLECharacteristic* statusChar = nullptr;
-String authToken;
-uint32_t authTokenExpiresAtMs = 0;
 bool verboseLogging = false;
 
 void publishStatus(const String& text);
 String urlEncode(const String& in);
+int findAdsbCacheIndex(const String& modeS);
+int reserveAdsbCacheIndex();
+bool rectsOverlap(const RectRegion& a, const RectRegion& b);
+int metersToFlightLevel(float meters);
 
 void debugLog(const String& msg) {
   Serial.println("[DBG] " + msg);
@@ -201,24 +212,27 @@ bool isInterestingIcaoType(const String& icaoTypeIn) {
   if (t.isEmpty()) return false;
 
   const char* exactTypes[] = {
-    "A388", "A359", "A35K", "A346", "A345", "A333", "A332", "A339", "A343",
-    "B744", "B748", "B77W", "B772", "B773", "B788", "B789", "B78X", "B763",
-    "MD11", "DC10", "L101", "C17", "C5M", "C5", "A400", "E3TF", "E8", "K35R",
-    "KC46", "KC10", "R135", "P8", "E767", "F15", "F16", "F18", "F22", "F35",
-    "RFAL", "EUFI", "JAS3", "SU27", "SU30", "SU34", "M346"
+    // Airbus
+    "A20N", "A21N", "A318", "A319", "A320", "A321",
+    "A332", "A333", "A338", "A339", "A342", "A343", "A345", "A346", 
+    "A359", "A35K", "A388", "BCS1", "BCS3", "A306", "A310",
+    // Boeing
+    "B733", "B734", "B735", "B736", "B737", "B738", "B739", "B38M", "B39M", 
+    "B744", "B748", "B74F", "B752", "B753", "B762", "B763", "B764", 
+    "B772", "B773", "B77W", "B77L", "B77F", "B788", "B789", "B78X",
+    // Regional and Private (Embraer, Bombardier, ATR, Dash 8, Pilatus, etc)
+    "E170", "E175", "E190", "E195", "E290", "E295",
+    "CRJ1", "CRJ2", "CRJ7", "CRJ9", "CRJX", "AT43", "AT45", "AT72", "AT75", "AT76", "DH8A", "DH8B", "DH8C", "DH8D", "PC24", 
+    // Other Heavy / Cargo
+    "MD11", "DC10", "MD1F", "DC1F", "L101", "A124", "A225", "IL76",
+    // Military Heavy (Transport, AWACS, Tanker, Bomber)
+    "C17", "C5", "C5M", "A400", "C130", "C30J", "K35R", "KC46", "KC10", "E3TF", "E3", "E4", "E6", "E8", "R135", "P8", "E767", "U2", "B1", "B2", "B52",
+    // Military Fighters / Attack / VTOL
+    "F15", "F16", "F18", "F22", "F35", "F117", "A10", "RFAL", "EUFI", "JAS3", "TNDO", "SU27", "SU30", "SU34", "SU35", "SU57", "MG29", "MG31", "MG35", "M346", "V22"
   };
 
   for (size_t i = 0; i < sizeof(exactTypes) / sizeof(exactTypes[0]); i++) {
     if (t == exactTypes[i]) return true;
-  }
-
-  const char* prefixTypes[] = {
-    "A3", "A2", "A1", "B7", "B8", "B9", "E17", "E19", "E2", "C17", "C5", "KC",
-    "IL7", "AN12", "AN22", "F1", "F2", "F3", "SU", "MIG"
-  };
-
-  for (size_t i = 0; i < sizeof(prefixTypes) / sizeof(prefixTypes[0]); i++) {
-    if (t.startsWith(prefixTypes[i])) return true;
   }
 
   return false;
@@ -390,130 +404,6 @@ String urlEncode(const String& in) {
   return out;
 }
 
-String base64Encode(const String& in) {
-  static const char* table = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-  String out;
-  size_t len = in.length();
-  out.reserve(((len + 2) / 3) * 4);
-
-  for (size_t i = 0; i < len; i += 3) {
-    uint32_t octetA = (uint8_t)in[i];
-    uint32_t octetB = (i + 1 < len) ? (uint8_t)in[i + 1] : 0;
-    uint32_t octetC = (i + 2 < len) ? (uint8_t)in[i + 2] : 0;
-
-    uint32_t triple = (octetA << 16) | (octetB << 8) | octetC;
-    out += table[(triple >> 18) & 0x3F];
-    out += table[(triple >> 12) & 0x3F];
-    out += (i + 1 < len) ? table[(triple >> 6) & 0x3F] : '=';
-    out += (i + 2 < len) ? table[triple & 0x3F] : '=';
-  }
-
-  return out;
-}
-
-bool refreshAuthToken() {
-  if (cfg.apiClientId.isEmpty() || cfg.apiClientSecret.isEmpty()) {
-    authToken = "";
-    authTokenExpiresAtMs = 0;
-    return false;
-  }
-
-  String clientId = cfg.apiClientId;
-  String clientSecret = cfg.apiClientSecret;
-  clientId.trim();
-  clientSecret.trim();
-  if (clientId.isEmpty() || clientSecret.isEmpty()) {
-    authToken = "";
-    authTokenExpiresAtMs = 0;
-    publishStatus("Token creds empty");
-    return false;
-  }
-
-  authToken = "";
-  authTokenExpiresAtMs = 0;
-
-  auto tryTokenRequest = [&](bool useBasicAuth) -> bool {
-    WiFiClientSecure client;
-    client.setInsecure();
-
-    HTTPClient http;
-    http.setConnectTimeout(6000);
-    http.setTimeout(9000);
-
-    if (!http.begin(client, "https://auth.opensky-network.org/auth/realms/opensky-network/protocol/openid-connect/token")) {
-      publishStatus("Token begin failed");
-      return false;
-    }
-
-    http.addHeader("Content-Type", "application/x-www-form-urlencoded");
-    http.addHeader("Accept", "application/json");
-
-    String body;
-    if (useBasicAuth) {
-      String basic = base64Encode(clientId + ":" + clientSecret);
-      http.addHeader("Authorization", "Basic " + basic);
-      body = "grant_type=client_credentials";
-      debugLog("Token request method=basic_auth");
-    } else {
-      body = "grant_type=client_credentials&client_id=" + urlEncode(clientId) +
-             "&client_secret=" + urlEncode(clientSecret);
-      debugLog("Token request method=form_fields");
-    }
-
-    int code = http.POST(body);
-    String payload = http.getString();
-    http.end();
-
-    if (verboseLogging) {
-      Serial.println("[VRB] Token response payload:");
-      Serial.println(payload);
-    }
-
-    if (code != HTTP_CODE_OK) {
-      String preview = payload.substring(0, 160);
-      preview.replace("\n", " ");
-      preview.replace("\r", " ");
-      debugLog("Token HTTP " + String(code) + " payload='" + preview + "'");
-
-      JsonDocument errDoc;
-      DeserializationError derr = deserializeJson(errDoc, payload);
-      if (!derr && !errDoc["error"].isNull()) {
-        String errCode = String((const char*)errDoc["error"]);
-        String errDesc = errDoc["error_description"].isNull() ? "" : String((const char*)errDoc["error_description"]);
-        errDesc.trim();
-        if (errDesc.length() > 42) errDesc = errDesc.substring(0, 42);
-        publishStatus("Token " + String(code) + " " + errCode + (errDesc.isEmpty() ? "" : (":" + errDesc)));
-      } else {
-        publishStatus("Token HTTP " + String(code));
-      }
-      return false;
-    }
-
-    JsonDocument doc;
-    DeserializationError err = deserializeJson(doc, payload);
-    if (err || doc["access_token"].isNull()) {
-      publishStatus("Token parse err");
-      return false;
-    }
-
-    authToken = String((const char*)doc["access_token"]);
-    uint32_t expiresIn = doc["expires_in"].isNull() ? 1800U : doc["expires_in"].as<uint32_t>();
-    uint32_t margin = (expiresIn > 60U) ? 60U : 5U;
-    authTokenExpiresAtMs = millis() + (expiresIn - margin) * 1000U;
-    debugLog("Token OK exp_in=" + String(expiresIn));
-    return true;
-  };
-
-  if (tryTokenRequest(false)) return true;
-  return tryTokenRequest(true);
-}
-
-bool ensureAuthToken() {
-  if (cfg.apiClientId.isEmpty() || cfg.apiClientSecret.isEmpty()) return false;
-  if (!authToken.isEmpty() && millis() < authTokenExpiresAtMs) return true;
-  return refreshAuthToken();
-}
-
 void saveConfig() {
   prefs.begin("radar", false);
   prefs.putString("ssid", cfg.ssid);
@@ -623,15 +513,11 @@ class GenericWriteCallback : public NimBLECharacteristicCallbacks {
     else if (key_ == "speed") cfg.speedCutoffKts = clampf(v.toFloat(), 0.0f, 700.0f);
     else if (key_ == "client_id") {
       cfg.apiClientId = v;
-      authToken = "";
-      authTokenExpiresAtMs = 0;
       saveConfig();
       publishStatus("client_id saved");
     }
     else if (key_ == "client_secret") {
       cfg.apiClientSecret = v;
-      authToken = "";
-      authTokenExpiresAtMs = 0;
       saveConfig();
       publishStatus("client_secret saved");
     }
@@ -641,24 +527,14 @@ class GenericWriteCallback : public NimBLECharacteristicCallbacks {
 
       if (cmd == "save") {
         saveConfig();
-        authToken = "";
-        authTokenExpiresAtMs = 0;
         printConfigSummary();
         publishStatus("Config saved");
       } else if (cmd == "apply") {
         saveConfig();
-        authToken = "";
-        authTokenExpiresAtMs = 0;
         printConfigSummary();
         connectWiFi();
       } else if (cmd == "auth") {
-        if (cfg.apiClientId.isEmpty() || cfg.apiClientSecret.isEmpty()) {
-          publishStatus("Set client_id/secret first");
-        } else if (refreshAuthToken()) {
-          publishStatus("Auth token active");
-        } else {
-          publishStatus("Auth token failed");
-        }
+        publishStatus("Auth not needed for ADSB.fi");
       } else if (cmd == "verbose" || cmd == "verbose on") {
         verboseLogging = true;
         publishStatus("Verbose ON");
@@ -731,7 +607,7 @@ void setupBLE() {
   debugLog("BLE ready, advertising as " + String(nameBuf));
 }
 
-bool fetchOpenSky() {
+bool fetchAdsbFi() {
   uint32_t nowMs = millis();
   fetchEpoch++;
 
@@ -748,8 +624,8 @@ bool fetchOpenSky() {
     if (WiFi.status() != WL_CONNECTED) {
       if (nowMs - lastNoWiFiStatusMs > 15000UL) {
         lastNoWiFiStatusMs = nowMs;
-        debugLog("OpenSky skipped, WiFi not connected (" + wifiStatusToText(WiFi.status()) + ")");
-        publishStatus("No WiFi for OpenSky");
+        debugLog("ADSB.fi skipped, WiFi not connected (" + wifiStatusToText(WiFi.status()) + ")");
+        publishStatus("No WiFi for API");
       }
       return false;
     }
@@ -762,22 +638,15 @@ bool fetchOpenSky() {
     return false;
   }
 
-  float latDelta = cfg.radiusKm / 111.0f;
-  float lonScale = cosf(degToRad(cfg.centerLat));
-  if (fabs(lonScale) < 0.2f) lonScale = 0.2f;
-  float lonDelta = cfg.radiusKm / (111.0f * lonScale);
+  // Calculate distance in nautical miles (Max 250NM for adsb.fi API)
+  float distNm = cfg.radiusKm / 1.852f;
+  if (distNm > 250.0f) distNm = 250.0f;
 
-  float lamin = cfg.centerLat - latDelta;
-  float lamax = cfg.centerLat + latDelta;
-  float lomin = cfg.centerLon - lonDelta;
-  float lomax = cfg.centerLon + lonDelta;
-
-  String url = "https://opensky-network.org/api/states/all?lamin=" + String(lamin, 5) +
-               "&lomin=" + String(lomin, 5) +
-               "&lamax=" + String(lamax, 5) +
-               "&lomax=" + String(lomax, 5) +
-               "&extended=1";
-  debugLog("OpenSky GET " + url);
+  String url = "https://opendata.adsb.fi/api/v3/lat/" + String(cfg.centerLat, 5) +
+               "/lon/" + String(cfg.centerLon, 5) +
+               "/dist/" + String(distNm, 1);
+               
+  debugLog("ADSB.fi GET " + url);
 
   WiFiClientSecure client;
   client.setInsecure();
@@ -792,141 +661,27 @@ bool fetchOpenSky() {
     return false;
   }
 
-  bool authConfigured = !cfg.apiClientId.isEmpty() && !cfg.apiClientSecret.isEmpty();
-  bool authEnabled = ensureAuthToken();
-
-  if (authConfigured && !authEnabled) {
-    debugLog("OpenSky auth unavailable, falling back to anonymous");
-    publishStatus("Auth unavailable, anonymous mode");
-  }
-
-  if (authEnabled && !authToken.isEmpty()) {
-    http.addHeader("Authorization", "Bearer " + authToken);
-    debugLog("OpenSky auth: Bearer token attached");
-  } else {
-    debugLog("OpenSky auth: anonymous request");
-  }
-
   int code = http.GET();
-  if (code == HTTP_CODE_UNAUTHORIZED && authEnabled && refreshAuthToken()) {
-    debugLog("OpenSky auth: 401 received, refreshing token and retrying");
-    http.end();
-
-    WiFiClientSecure retryClient;
-    retryClient.setInsecure();
-    HTTPClient retry;
-    retry.setConnectTimeout(7000);
-    retry.setTimeout(9000);
-    retry.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
-    if (!retry.begin(retryClient, url)) {
-      publishStatus("HTTP begin failed");
-      return false;
-    }
-    if (!authToken.isEmpty()) {
-      retry.addHeader("Authorization", "Bearer " + authToken);
-      debugLog("OpenSky auth: refreshed Bearer token attached");
-    }
-    code = retry.GET();
-    lastHttpCode = code;
-    if (code != HTTP_CODE_OK) {
-      publishStatus("OpenSky HTTP " + String(code));
-      retry.end();
-      return false;
-    }
-    String payload = retry.getString();
-    debugLog("OpenSky payload bytes=" + String(payload.length()));
-    if (verboseLogging) {
-      Serial.println("[VRB] OpenSky response payload (retry):");
-      Serial.println(payload);
-    }
-
-    JsonDocument doc;
-    DeserializationError err = deserializeJson(doc, payload);
-    retry.end();
-
-    if (err) {
-      String preview = payload.substring(0, 120);
-      preview.replace("\n", " ");
-      preview.replace("\r", " ");
-      debugLog("JSON err=" + String(err.c_str()) + " preview='" + preview + "'");
-      publishStatus("JSON err: " + String(err.c_str()));
-      return false;
-    }
-
-    JsonArray states = doc["states"].as<JsonArray>();
-    if (states.isNull()) {
-      aircraftCount = 0;
-      return true;
-    }
-
-    int count = 0;
-    for (JsonVariant v : states) {
-      if (count >= MAX_AIRCRAFT) break;
-
-      JsonArray s = v.as<JsonArray>();
-      if (s.isNull() || s.size() < 11) continue;
-      if (s[5].isNull() || s[6].isNull()) continue;
-
-      float lon = s[5].as<float>();
-      float lat = s[6].as<float>();
-      float dist = greatCircleKm(cfg.centerLat, cfg.centerLon, lat, lon);
-      if (dist > cfg.radiusKm) continue;
-
-      String callsign = s[1].isNull() ? "" : String((const char*)s[1]);
-      callsign.trim();
-      if (callsign.isEmpty()) callsign = "UNK";
-
-      String modeS = s[0].isNull() ? "" : String((const char*)s[0]);
-      modeS.toUpperCase();
-      modeS.trim();
-      if (modeS.isEmpty()) continue;
-
-      float trackDeg = s[10].isNull() ? 0.0f : s[10].as<float>();
-      float velocity = s[9].isNull() ? 0.0f : s[9].as<float>();
-      if (mpsToKnots(velocity) <= cfg.speedCutoffKts) continue;
-
-      float altitudeM = 0.0f;
-      if (!s[13].isNull()) altitudeM = s[13].as<float>();
-      else if (!s[7].isNull()) altitudeM = s[7].as<float>();
-
-      aircraft[count].callsign = callsign;
-      aircraft[count].modeS = modeS;
-      aircraft[count].icaoType = "";
-      aircraft[count].routeIata = "";
-      String cachedRoute;
-      if (getCachedRoute(modeS, cachedRoute)) aircraft[count].routeIata = cachedRoute;
-      aircraft[count].lat = lat;
-      aircraft[count].lon = lon;
-      aircraft[count].trackDeg = trackDeg;
-      aircraft[count].velocity = velocity;
-      aircraft[count].altitudeM = altitudeM;
-      count++;
-    }
-
-    aircraftCount = count;
-    applyCachedRoutesToCurrentAircraft();
-    successfulFetchCount++;
-    debugLog("OpenSky parsed aircraft=" + String(aircraftCount));
-    publishStatus("Aircraft: " + String(aircraftCount));
-    dynamicDirty = true;
-    return true;
-  }
-
   lastHttpCode = code;
+  
   if (code != HTTP_CODE_OK) {
-    publishStatus("OpenSky HTTP " + String(code));
+    publishStatus("ADSB.fi HTTP " + String(code));
     http.end();
     return false;
   }
 
   String payload = http.getString();
-  debugLog("OpenSky payload bytes=" + String(payload.length()));
+  debugLog("ADSB.fi payload bytes=" + String(payload.length()));
   if (verboseLogging) {
-    Serial.println("[VRB] OpenSky response payload:");
+    Serial.println("[VRB] ADSB.fi response payload:");
     Serial.println(payload);
   }
 
+#if ARDUINOJSON_VERSION_MAJOR == 6
+  DynamicJsonDocument doc(32768);
+#else
   JsonDocument doc;
+#endif
   DeserializationError err = deserializeJson(doc, payload);
   http.end();
 
@@ -939,53 +694,76 @@ bool fetchOpenSky() {
     return false;
   }
 
-  JsonArray states = doc["states"].as<JsonArray>();
-  if (states.isNull()) {
+  // Extract the aircraft array (commonly "aircraft", occasionally "ac" in derivatives)
+  JsonArray aircraftList = doc["aircraft"].as<JsonArray>();
+  if (aircraftList.isNull()) {
+    aircraftList = doc["ac"].as<JsonArray>(); 
+  }
+
+  if (aircraftList.isNull()) {
     aircraftCount = 0;
     return true;
   }
 
   int count = 0;
-  for (JsonVariant v : states) {
+  for (JsonVariant v : aircraftList) {
     if (count >= MAX_AIRCRAFT) break;
 
-    JsonArray s = v.as<JsonArray>();
-    if (s.isNull() || s.size() < 11) continue;
+    // Reject incomplete position data
+    if (v["lat"].isNull() || v["lon"].isNull()) continue;
 
-    if (s[5].isNull() || s[6].isNull()) continue;
-
-    float lon = s[5].as<float>();
-    float lat = s[6].as<float>();
+    float lat = v["lat"].as<float>();
+    float lon = v["lon"].as<float>();
+    
+    // Ensure strict radar boundary check
     float dist = greatCircleKm(cfg.centerLat, cfg.centerLon, lat, lon);
     if (dist > cfg.radiusKm) continue;
 
-    String callsign = s[1].isNull() ? "" : String((const char*)s[1]);
+    String callsign = v["flight"].isNull() ? "" : String((const char*)v["flight"]);
     callsign.trim();
     if (callsign.isEmpty()) callsign = "UNK";
 
-    String modeS = s[0].isNull() ? "" : String((const char*)s[0]);
+    String modeS = v["hex"].isNull() ? "" : String((const char*)v["hex"]);
     modeS.toUpperCase();
     modeS.trim();
     if (modeS.isEmpty()) continue;
 
-    float trackDeg = s[10].isNull() ? 0.0f : s[10].as<float>();
-    float velocity = s[9].isNull() ? 0.0f : s[9].as<float>();
-    if (mpsToKnots(velocity) <= cfg.speedCutoffKts) continue;
+    float trackDeg = v["track"].isNull() ? 0.0f : v["track"].as<float>();
+    
+    // speed is reported in knots by adsb.fi
+    float gsKts = v["gs"].isNull() ? 0.0f : v["gs"].as<float>();
+    
+    // Convert to meters/sec to match the legacy internal math (for drawing/logic)
+    float velocityMps = gsKts * 0.514444f;
 
-    float altitudeM = 0.0f;
-    if (!s[13].isNull()) altitudeM = s[13].as<float>();
-    else if (!s[7].isNull()) altitudeM = s[7].as<float>();
+    // altitude is reported in feet (either geometric or barometric) by adsb.fi
+    float altFeet = 0.0f;
+    if (v["alt_geom"].is<float>() || v["alt_geom"].is<int>()) {
+      altFeet = v["alt_geom"].as<float>();
+    } else if (v["alt_baro"].is<float>() || v["alt_baro"].is<int>()) {
+      altFeet = v["alt_baro"].as<float>();
+    }
+    
+    // Convert to meters to match the legacy internal math
+    float altitudeM = altFeet * 0.3048f;
 
     aircraft[count].callsign = callsign;
     aircraft[count].modeS = modeS;
-    aircraft[count].icaoType = "";
+    
+    // If the DB includes 't' for type, map it
+    String icaoType = v["t"].isNull() ? "" : String((const char*)v["t"]);
+    aircraft[count].icaoType = icaoType;
+
+    if (!isInterestingIcaoType(icaoType)) continue;
+    
     aircraft[count].routeIata = "";
     String cachedRoute;
     if (getCachedRoute(modeS, cachedRoute)) aircraft[count].routeIata = cachedRoute;
+    
     aircraft[count].lat = lat;
     aircraft[count].lon = lon;
     aircraft[count].trackDeg = trackDeg;
-    aircraft[count].velocity = velocity;
+    aircraft[count].velocity = velocityMps;
     aircraft[count].altitudeM = altitudeM;
 
     count++;
@@ -994,7 +772,7 @@ bool fetchOpenSky() {
   aircraftCount = count;
   applyCachedRoutesToCurrentAircraft();
   successfulFetchCount++;
-  debugLog("OpenSky parsed aircraft=" + String(aircraftCount));
+  debugLog("ADSB.fi parsed aircraft=" + String(aircraftCount));
   publishStatus("Aircraft: " + String(aircraftCount));
   dynamicDirty = true;
   return true;
@@ -1040,6 +818,32 @@ bool rectsOverlap(const RectRegion& a, const RectRegion& b) {
   return !(a.x + a.w <= b.x || b.x + b.w <= a.x || a.y + a.h <= b.y || b.y + b.h <= a.y);
 }
 
+void pushCanvasRegion(int x, int y, int w, int h) {
+  int x0 = max(0, x);
+  int y0 = max(0, y);
+  int x1 = min(SCREEN_W, x + w);
+  int y1 = min(SCREEN_H, y + h);
+  int rw = x1 - x0;
+  int rh = y1 - y0;
+  if (rw <= 0 || rh <= 0) return;
+
+  uint16_t* buf = (uint16_t*)malloc(rw * rh * 2);
+  uint16_t* src = canvas.getBuffer();
+
+  if (buf) {
+    for (int yy = 0; yy < rh; yy++) {
+      memcpy(&buf[yy * rw], &src[(y0 + yy) * SCREEN_W + x0], rw * 2);
+    }
+    tft.drawRGBBitmap(x0, y0, buf, rw, rh);
+    free(buf);
+  } else {
+    // Fallback to pushing line-by-line if malloc fails
+    for (int yy = 0; yy < rh; yy++) {
+      tft.drawRGBBitmap(x0, y0 + yy, &src[(y0 + yy) * SCREEN_W + x0], rw, 1);
+    }
+  }
+}
+
 bool rectOverlapsAircraftMarker(const RectRegion& r, int markerX, int markerY) {
   RectRegion markerBox = {
     (int16_t)(markerX - 5),
@@ -1050,116 +854,59 @@ bool rectOverlapsAircraftMarker(const RectRegion& r, int markerX, int markerY) {
   return rectsOverlap(r, markerBox);
 }
 
-void addCurrentRegion(int x, int y, int w, int h) {
-  if (currentDynamicRegionCount >= MAX_DYNAMIC_REGIONS) return;
-  if (w <= 0 || h <= 0) return;
-
-  int x0 = max(0, x);
-  int y0 = max(0, y);
-  int x1 = min(SCREEN_W, x + w);
-  int y1 = min(SCREEN_H, y + h);
-  if (x1 <= x0 || y1 <= y0) return;
-
-  currentDynamicRegions[currentDynamicRegionCount++] = {
-    (int16_t)x0,
-    (int16_t)y0,
-    (int16_t)(x1 - x0),
-    (int16_t)(y1 - y0)
-  };
+AdsbCacheEntry* getOrAllocateCacheEntry(const String& modeS) {
+  int idx = findAdsbCacheIndex(modeS);
+  if (idx < 0) {
+    idx = reserveAdsbCacheIndex();
+    adsbCache[idx].used = true;
+    adsbCache[idx].modeS = modeS;
+    adsbCache[idx].routeIata = "";
+    adsbCache[idx].lookedUp = false;
+    adsbCache[idx].hasRoute = false;
+    adsbCache[idx].hasLabelAngle = false;
+  }
+  return &adsbCache[idx];
 }
 
-void restorePreviousDynamicRegions() {
-  if (!baseCanvasReady) return;
-
-  const uint16_t* baseBuf = baseCanvas.getBuffer();
-  static uint16_t lineBuf[SCREEN_W];
-
-  for (int i = 0; i < prevDynamicRegionCount; i++) {
-    RectRegion r = prevDynamicRegions[i];
-    for (int yy = r.y; yy < r.y + r.h; yy++) {
-      int src = yy * SCREEN_W + r.x;
-      for (int xx = 0; xx < r.w; xx++) {
-        lineBuf[xx] = baseBuf[src + xx];
-      }
-      tft.drawRGBBitmap(r.x, yy, lineBuf, r.w, 1);
-    }
-  }
+RectRegion getRectForAngle(float angle, int markerX, int markerY, int tagW, int tagH) {
+  int dist = 16;
+  int cx = markerX + (int)(cosf(angle) * dist);
+  int cy = markerY + (int)(sinf(angle) * dist);
+  int tx = cx;
+  int ty = cy;
+  if (cosf(angle) < 0) tx -= tagW;
+  if (sinf(angle) < 0) ty -= tagH;
+  return {(int16_t)tx, (int16_t)ty, (int16_t)tagW, (int16_t)tagH};
 }
 
-bool pickTagPosition(int blipX,
-                     int blipY,
-                     int tagW,
-                     int tagH,
-                     const int markerXs[],
-                     const int markerYs[],
-                     const bool markerValid[],
-                     int markerCount,
-                     const RectRegion placedTags[],
-                     int placedCount,
-                     int& outX,
-                     int& outY,
-                     bool& outNeedsLeader) {
-  auto isValid = [&](int x, int y) {
-    RectRegion cand = {(int16_t)x, (int16_t)y, (int16_t)tagW, (int16_t)tagH};
-
-    if (cand.x < 0 || cand.y < 0 || cand.x + cand.w > SCREEN_W || cand.y + cand.h > SCREEN_H) {
-      return false;
-    }
-
-    for (int j = 0; j < placedCount; j++) {
-      if (rectsOverlap(cand, placedTags[j])) return false;
-    }
-
-    for (int j = 0; j < markerCount; j++) {
-      if (!markerValid[j]) continue;
-      if (rectOverlapsAircraftMarker(cand, markerXs[j], markerYs[j])) return false;
-    }
-
-    return true;
-  };
-
-  // Prefer right/left of marker first.
-  const int preferredCount = 4;
-  int px[preferredCount] = {blipX + 8, blipX - tagW - 8, blipX + 8, blipX - tagW - 8};
-  int py[preferredCount] = {blipY - tagH / 2, blipY - tagH / 2, blipY - tagH - 4, blipY + 4};
-
-  for (int i = 0; i < preferredCount; i++) {
-    if (!isValid(px[i], py[i])) continue;
-    outX = px[i];
-    outY = py[i];
-    outNeedsLeader = false;
-    return true;
+bool isTargetValid(const RectRegion& cand, int myIdx, const int markerXs[], const int markerYs[], const bool markerValid[], int markerCount, const RectRegion placedTargets[], int placedCount) {
+  if (cand.x < 0 || cand.y < 0 || cand.x + cand.w > SCREEN_W || cand.y + cand.h > SCREEN_H) return false;
+  for (int j = 0; j < placedCount; j++) {
+    if (rectsOverlap(cand, placedTargets[j])) return false;
   }
-
-  // Fallback: find nearest valid position anywhere on screen.
-  int bestX = -1;
-  int bestY = -1;
-  uint32_t bestDist2 = 0xFFFFFFFFu;
-  const int step = 4;
-
-  for (int y = 0; y <= SCREEN_H - tagH; y += step) {
-    for (int x = 0; x <= SCREEN_W - tagW; x += step) {
-      if (!isValid(x, y)) continue;
-      int dx = (x + tagW / 2) - blipX;
-      int dy = (y + tagH / 2) - blipY;
-      uint32_t d2 = (uint32_t)(dx * dx + dy * dy);
-      if (d2 < bestDist2) {
-        bestDist2 = d2;
-        bestX = x;
-        bestY = y;
-      }
-    }
+  for (int j = 0; j < markerCount; j++) {
+    if (!markerValid[j] || j == myIdx) continue;
+    if (rectOverlapsAircraftMarker(cand, markerXs[j], markerYs[j])) return false;
   }
-
-  if (bestX >= 0) {
-    outX = bestX;
-    outY = bestY;
-    outNeedsLeader = true;
-    return true;
-  }
-
-  return false;
+  return true;
 }
+
+void drawThickLine(Adafruit_GFX& gfx, int x0, int y0, int x1, int y1, uint16_t color) {
+  gfx.drawLine(x0, y0, x1, y1, color);
+  gfx.drawLine(x0 + 1, y0, x1 + 1, y1, color);
+  gfx.drawLine(x0, y0 + 1, x1, y1 + 1, color);
+}
+
+struct TagToDraw {
+  int tx;
+  int ty;
+  int tagW;
+  int tagH;
+  String cs;
+  int fl;
+  int kts;
+  String route;
+};
 
 void drawAircraft(Adafruit_GFX& gfx) {
   int markerX[MAX_AIRCRAFT];
@@ -1202,85 +949,117 @@ void drawAircraft(Adafruit_GFX& gfx) {
     addCurrentRegion(lx, ly, abs(hx - x) + 3, abs(hy - y) + 3);
   }
 
-  // Pass 2: place labels with overlap avoidance.
-  RectRegion placedTags[MAX_TAGS_ON_SCREEN];
-  int placedTagCount = 0;
+  // Pass 2: calculate target angles and draw thick leader lines.
+  RectRegion placedTargets[MAX_TAGS_ON_SCREEN];
+  TagToDraw tagsToDraw[MAX_TAGS_ON_SCREEN];
   int tagsDrawn = 0;
 
   for (int i = 0; i < aircraftCount; i++) {
     if (!markerValid[i]) continue;
+    if (tagsDrawn >= MAX_TAGS_ON_SCREEN) break;
+    
+    AdsbCacheEntry* cache = getOrAllocateCacheEntry(aircraft[i].modeS);
+    if (!cache->hasLabelAngle) {
+      cache->targetLabelAngle = -0.785398f; // Start everyone sliding out to Top-Right (-PI/4)
+      cache->currentLabelAngle = -0.785398f;
+      cache->hasLabelAngle = true;
+    }
+
     int x = markerX[i];
     int y = markerY[i];
 
-    if (tagsDrawn < MAX_TAGS_ON_SCREEN) {
-      String cs = aircraft[i].callsign;
-      if (cs.isEmpty()) cs = "UNK";
-      if (cs.length() > 8) cs = cs.substring(0, 8);
+    String cs = aircraft[i].callsign;
+    if (cs.isEmpty()) cs = "UNK";
+    if (cs.length() > 8) cs = cs.substring(0, 8);
 
-      int fl = metersToFlightLevel(aircraft[i].altitudeM);
-      int kts = (int)(mpsToKnots(aircraft[i].velocity) + 0.5f);
-      String route = aircraft[i].routeIata;
-      route.trim();
-      bool hasRoute = !route.isEmpty();
+    int fl = metersToFlightLevel(aircraft[i].altitudeM);
+    int kts = (int)(mpsToKnots(aircraft[i].velocity) + 0.5f);
+    String route = aircraft[i].routeIata;
+    route.trim();
+    bool hasRoute = !route.isEmpty();
 
-      int tagW = 104;
-      int tagH = hasRoute ? 27 : 18;
-      int tx = 0;
-      int ty = 0;
-      bool needsLeader = false;
+    int tagW = 104;
+    int tagH = hasRoute ? 27 : 18;
 
-      if (!pickTagPosition(x,
-                           y,
-                           tagW,
-                           tagH,
-                           markerX,
-                           markerY,
-                           markerValid,
-                           aircraftCount,
-                           placedTags,
-                           placedTagCount,
-                           tx,
-                           ty,
-                           needsLeader)) {
-        continue;
+    // Find best target angle
+    float bestAngle = cache->targetLabelAngle;
+    RectRegion cand = getRectForAngle(bestAngle, x, y, tagW, tagH);
+    if (!isTargetValid(cand, i, markerX, markerY, markerValid, aircraftCount, placedTargets, tagsDrawn)) {
+      bool found = false;
+      for (float delta = 0.2f; delta <= 3.15f; delta += 0.2f) {
+        cand = getRectForAngle(cache->targetLabelAngle + delta, x, y, tagW, tagH);
+        if (isTargetValid(cand, i, markerX, markerY, markerValid, aircraftCount, placedTargets, tagsDrawn)) {
+          bestAngle = cache->targetLabelAngle + delta;
+          found = true; break;
+        }
+        cand = getRectForAngle(cache->targetLabelAngle - delta, x, y, tagW, tagH);
+        if (isTargetValid(cand, i, markerX, markerY, markerValid, aircraftCount, placedTargets, tagsDrawn)) {
+          bestAngle = cache->targetLabelAngle - delta;
+          found = true; break;
+        }
       }
-
-      gfx.setTextColor(radarGreen(210));
-
-      gfx.setCursor(tx, ty);
-      gfx.print(cs);
-
-      gfx.setCursor(tx, ty + 9);
-      gfx.print("FL");
-      gfx.print(fl);
-      gfx.print(" ");
-      gfx.print(kts);
-
-      if (hasRoute) {
-        gfx.setCursor(tx, ty + 18);
-        gfx.print(route);
-      }
-
-      if (needsLeader) {
-        int ex = x;
-        if (ex < tx) ex = tx;
-        if (ex > tx + tagW - 1) ex = tx + tagW - 1;
-        int ey = y;
-        if (ey < ty) ey = ty;
-        if (ey > ty + tagH - 1) ey = ty + tagH - 1;
-        gfx.drawLine(x, y, ex, ey, radarGreen(90));
-        int lx = min(x, ex) - 1;
-        int ly = min(y, ey) - 1;
-        addCurrentRegion(lx, ly, abs(ex - x) + 3, abs(ey - y) + 3);
-      }
-
-      addCurrentRegion(tx - 1, ty - 1, tagW + 2, tagH + 2);
-      if (placedTagCount < MAX_TAGS_ON_SCREEN) {
-        placedTags[placedTagCount++] = {(int16_t)tx, (int16_t)ty, (int16_t)tagW, (int16_t)tagH};
-      }
-
-      tagsDrawn++;
     }
+    cache->targetLabelAngle = bestAngle;
+    placedTargets[tagsDrawn] = getRectForAngle(bestAngle, x, y, tagW, tagH);
+
+    // Slide current angle
+    float diff = cache->targetLabelAngle - cache->currentLabelAngle;
+    while (diff > PI) diff -= 2.0f * PI;
+    while (diff <= -PI) diff += 2.0f * PI;
+    float maxSpeed = 0.15f; // Slide speed limit (radians per frame)
+    if (diff > maxSpeed) diff = maxSpeed;
+    if (diff < -maxSpeed) diff = -maxSpeed;
+    cache->currentLabelAngle += diff;
+    while (cache->currentLabelAngle > PI) cache->currentLabelAngle -= 2.0f * PI;
+    while (cache->currentLabelAngle <= -PI) cache->currentLabelAngle += 2.0f * PI;
+
+    // Get actual drawing rect
+    RectRegion curRect = getRectForAngle(cache->currentLabelAngle, x, y, tagW, tagH);
+
+    // Draw leader line (will be hidden under the label's black background box next pass)
+    int cx = curRect.x + tagW / 2;
+    int cy = curRect.y + tagH / 2;
+    drawThickLine(gfx, x, y, cx, cy, radarGreen(90));
+
+    int lx = min(x, cx) - 1;
+    int rx = max(x, cx) + 2;
+    int ty_line = min(y, cy) - 1;
+    int by_line = max(y, cy) + 2;
+    addCurrentRegion(lx, ty_line, rx - lx, by_line - ty_line);
+
+    // Save to draw tags later
+    tagsToDraw[tagsDrawn].tx = curRect.x;
+    tagsToDraw[tagsDrawn].ty = curRect.y;
+    tagsToDraw[tagsDrawn].tagW = tagW;
+    tagsToDraw[tagsDrawn].tagH = tagH;
+    tagsToDraw[tagsDrawn].cs = cs;
+    tagsToDraw[tagsDrawn].fl = fl;
+    tagsToDraw[tagsDrawn].kts = kts;
+    tagsToDraw[tagsDrawn].route = route;
+
+    tagsDrawn++;
+  }
+
+  // Pass 3: draw labels with transparent background
+  for (int j = 0; j < tagsDrawn; j++) {
+    TagToDraw& t = tagsToDraw[j];
+
+    gfx.setTextColor(radarGreen(210));
+    gfx.setCursor(t.tx, t.ty);
+    gfx.print(t.cs);
+
+    gfx.setCursor(t.tx, t.ty + 9);
+    gfx.print("FL");
+    gfx.print(t.fl);
+    gfx.print(" ");
+    gfx.print(t.kts);
+
+    if (!t.route.isEmpty()) {
+      gfx.setCursor(t.tx, t.ty + 18);
+      gfx.print(t.route);
+    }
+
+    addCurrentRegion(t.tx - 1, t.ty - 1, t.tagW + 2, t.tagH + 2);
   }
 }
 
@@ -1296,46 +1075,44 @@ void drawHud(Adafruit_GFX& gfx) {
   gfx.print("AC:");
   gfx.print(aircraftCount);
 
-  addCurrentRegion(6, 4, 64, 20);
-}
-
-void drawStaticBase(Adafruit_GFX& gfx) {
-  gfx.fillScreen(0x0000);
-  drawGrid(gfx);
-}
-
-void drawDynamicLayer() {
-  if (baseCanvasReady) {
-    restorePreviousDynamicRegions();
-  } else {
-    drawStaticBase(tft);
-  }
-
-  currentDynamicRegionCount = 0;
-  drawAircraft(tft);
-  drawHud(tft);
-
-  for (int i = 0; i < currentDynamicRegionCount; i++) {
-    prevDynamicRegions[i] = currentDynamicRegions[i];
-  }
-  prevDynamicRegionCount = currentDynamicRegionCount;
+  addCurrentRegion(6, 4, 80, 24);
 }
 
 void drawRadarFrame() {
-  if (staticBaseDirty) {
-    if (baseCanvasReady) {
-      drawStaticBase(baseCanvas);
-      tft.drawRGBBitmap(0, 0, baseCanvas.getBuffer(), SCREEN_W, SCREEN_H);
-    } else {
-      drawStaticBase(tft);
-    }
-    prevDynamicRegionCount = 0;
-    staticBaseDirty = false;
-    dynamicDirty = true;
-  }
-
   if (dynamicDirty) {
-    drawDynamicLayer();
+    if (canvasReady) {
+      canvas.fillScreen(0x0000);
+      drawGrid(canvas);
+
+      currentDynamicRegionCount = 0;
+      drawAircraft(canvas);
+      drawHud(canvas);
+
+      if (firstFrame) {
+        tft.drawRGBBitmap(0, 0, canvas.getBuffer(), SCREEN_W, SCREEN_H);
+        firstFrame = false;
+      } else {
+        for (int i = 0; i < prevDynamicRegionCount; i++) {
+          RectRegion r = prevDynamicRegions[i];
+          pushCanvasRegion(r.x, r.y, r.w, r.h);
+        }
+        for (int i = 0; i < currentDynamicRegionCount; i++) {
+          RectRegion r = currentDynamicRegions[i];
+          pushCanvasRegion(r.x, r.y, r.w, r.h);
+        }
+      }
+
+      prevDynamicRegionCount = currentDynamicRegionCount;
+      for (int i = 0; i < currentDynamicRegionCount; i++) {
+        prevDynamicRegions[i] = currentDynamicRegions[i];
+      }
+    } else {
+      // Memory allocation failed fallback
+      tft.fillScreen(0x0000);
+      drawGrid(tft);
+      drawAircraft(tft);
+      drawHud(tft);
+    }
     dynamicDirty = false;
   }
 }
@@ -1346,13 +1123,14 @@ void setupDisplay() {
     digitalWrite(PIN_TFT_BL, HIGH);
   }
 
-  SPI.begin(PIN_TFT_SCK, -1, PIN_TFT_MOSI, PIN_TFT_CS);
+  // Pass -1 to hardware SPI to allow Adafruit_GFX to manually manage the CS pin
+  SPI.begin(PIN_TFT_SCK, -1, PIN_TFT_MOSI, -1);
   tft.begin();
   tft.setRotation(0);
   tft.fillScreen(0x0000);
 
-  baseCanvasReady = (baseCanvas.getBuffer() != nullptr);
-  if (!baseCanvasReady) {
+  canvasReady = (canvas.getBuffer() != nullptr);
+  if (!canvasReady) {
     Serial.println("[WARN] Framebuffer alloc failed, using direct mode");
   }
 }
@@ -1368,7 +1146,8 @@ void setup() {
   setupBLE();
 
   connectWiFi();
-  if (fetchOpenSky()) {
+  // Fetch from ADSB.fi on boot
+  if (fetchAdsbFi()) {
     dynamicDirty = true;
   }
   drawRadarFrame();
@@ -1379,7 +1158,7 @@ void loop() {
 
   if (now - lastFetchMs > FETCH_INTERVAL_MS) {
     lastFetchMs = now;
-    if (fetchOpenSky()) {
+    if (fetchAdsbFi()) {
       dynamicDirty = true;
     }
   }
