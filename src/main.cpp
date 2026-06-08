@@ -28,9 +28,9 @@ constexpr int RADAR_RADIUS_PX = 108;
 // -------------------- App behavior --------------------
 constexpr uint32_t FETCH_INTERVAL_MS = 1500;
 constexpr uint32_t BLIP_REFRESH_INTERVAL_MS = 1500;
-constexpr int MAX_AIRCRAFT = 80;
+constexpr int MAX_AIRCRAFT = 40;
 constexpr int MAX_TAGS_ON_SCREEN = 18;
-constexpr int MAX_ADSB_CACHE = 96;
+constexpr int MAX_ADSB_CACHE = 40;
 constexpr uint32_t ADSB_LOOKUP_SPACING_MS = 1200;
 
 Adafruit_GC9A01A tft(PIN_TFT_CS, PIN_TFT_DC, PIN_TFT_RST);
@@ -44,6 +44,7 @@ struct Config {
   float centerLon;
   float radiusKm;
   float speedCutoffKts;
+  bool showAirports;
   String apiClientId;
   String apiClientSecret;
 };
@@ -62,8 +63,38 @@ struct Aircraft {
   float altitudeM;
 };
 
+struct Airport {
+  const char* iata;
+  float lat;
+  float lon;
+};
+
 Aircraft aircraft[MAX_AIRCRAFT];
 int aircraftCount = 0;
+
+#define NUM_COLORS 16
+uint16_t planeColors[NUM_COLORS];
+int nextColorIdx = 0;
+
+void setupColors() {
+  uint32_t hexColors[NUM_COLORS] = {
+    0x9ad48b, 0x448f30, 0x236a10, 0x6cb359, 0x69A097, 0x246c60, 0x0c4f44, 0x43877b,
+    0x78131f, 0xa33643, 0xf29ea8, 0xcc6571, 0xd5956a, 0x7d3e14, 0xaa6739, 0xfcc8a5
+  };
+  randomSeed(esp_random());
+  for (int i = 0; i < NUM_COLORS; i++) {
+    uint8_t r = (hexColors[i] >> 16) & 0xFF;
+    uint8_t g = (hexColors[i] >> 8) & 0xFF;
+    uint8_t b = hexColors[i] & 0xFF;
+    planeColors[i] = ((r & 0xF8) << 8) | ((g & 0xFC) << 3) | (b >> 3);
+  }
+  for (int i = 0; i < NUM_COLORS; i++) {
+    int swapIdx = random(NUM_COLORS);
+    uint16_t temp = planeColors[i];
+    planeColors[i] = planeColors[swapIdx];
+    planeColors[swapIdx] = temp;
+  }
+}
 
 uint32_t lastFetchMs = 0;
 uint32_t lastBlipDrawMs = 0;
@@ -80,6 +111,13 @@ uint32_t lastNoWiFiStatusMs = 0;
 uint32_t lastWiFiRetryMs = 0;
 uint32_t lastAdsbLookupMs = 0;
 
+constexpr int MAX_TRAIL = 20;
+
+struct Position {
+  float lat;
+  float lon;
+};
+
 struct AdsbCacheEntry {
   bool used;
   String modeS;
@@ -90,6 +128,12 @@ struct AdsbCacheEntry {
   float currentLabelAngle;
   float targetLabelAngle;
   uint32_t lastLookupMs;
+
+  uint16_t color;
+  Position trail[MAX_TRAIL];
+  int trailHead;
+  int trailCount;
+  uint32_t lastSeenMs;
 };
 
 AdsbCacheEntry adsbCache[MAX_ADSB_CACHE];
@@ -101,11 +145,17 @@ struct RectRegion {
   int16_t h;
 };
 
-constexpr int MAX_DYNAMIC_REGIONS = 160;
+constexpr int MAX_DYNAMIC_REGIONS = 150;
 RectRegion prevDynamicRegions[MAX_DYNAMIC_REGIONS];
 int prevDynamicRegionCount = 0;
 RectRegion currentDynamicRegions[MAX_DYNAMIC_REGIONS];
 int currentDynamicRegionCount = 0;
+
+const Airport majorAirports[] = {
+  {"LHR", 51.4700, -0.4543}, {"CDG", 49.0097, 2.5479}, {"FRA", 50.0379, 8.5622},
+  {"AMS", 52.3105, 4.7683},  {"JFK", 40.6413, -73.7781}, {"LAX", 33.9416, -118.4085},
+  {"HND", 35.5494, 139.7798}, {"DXB", 25.2532, 55.3657}, {"SIN", 1.3644, 103.9915}
+};
 
 void addCurrentRegion(int x, int y, int w, int h) {
   if (currentDynamicRegionCount >= MAX_DYNAMIC_REGIONS) return;
@@ -134,6 +184,7 @@ int findAdsbCacheIndex(const String& modeS);
 int reserveAdsbCacheIndex();
 bool rectsOverlap(const RectRegion& a, const RectRegion& b);
 int metersToFlightLevel(float meters);
+AdsbCacheEntry* getOrAllocateCacheEntry(const String& modeS);
 
 void debugLog(const String& msg) {
   Serial.println("[DBG] " + msg);
@@ -250,10 +301,12 @@ int reserveAdsbCacheIndex() {
     if (!adsbCache[i].used) return i;
   }
   int oldest = 0;
-  uint32_t oldestTs = adsbCache[0].lastLookupMs;
-  for (int i = 1; i < MAX_ADSB_CACHE; i++) {
-    if (adsbCache[i].lastLookupMs < oldestTs) {
-      oldestTs = adsbCache[i].lastLookupMs;
+  uint32_t maxAge = 0;
+  uint32_t now = millis();
+  for (int i = 0; i < MAX_ADSB_CACHE; i++) {
+    uint32_t age = now - adsbCache[i].lastSeenMs;
+    if (age >= maxAge) {
+      maxAge = age;
       oldest = i;
     }
   }
@@ -343,19 +396,17 @@ void lookupOnePendingAdsbdbRoute() {
       continue;
     }
 
-    if (idx < 0) idx = reserveAdsbCacheIndex();
-    adsbCache[idx].used = true;
-    adsbCache[idx].modeS = modeS;
+    AdsbCacheEntry* cache = getOrAllocateCacheEntry(modeS);
 
     String routeIata = "";
     bool requestOk = fetchAdsbdbRoute(modeS, aircraft[i].callsign, routeIata);
 
-    adsbCache[idx].lookedUp = true;
-    adsbCache[idx].lastLookupMs = millis();
-    adsbCache[idx].routeIata = routeIata;
-    adsbCache[idx].hasRoute = requestOk && !routeIata.isEmpty();
+    cache->lookedUp = true;
+    cache->lastLookupMs = millis();
+    cache->routeIata = routeIata;
+    cache->hasRoute = requestOk && !routeIata.isEmpty();
 
-    if (adsbCache[idx].hasRoute) {
+    if (cache->hasRoute) {
       aircraft[i].routeIata = routeIata;
       dynamicDirty = true;
     }
@@ -412,6 +463,7 @@ void saveConfig() {
   prefs.putFloat("clon", cfg.centerLon);
   prefs.putFloat("rad", cfg.radiusKm);
   prefs.putFloat("spd", cfg.speedCutoffKts);
+  prefs.putBool("showapt", cfg.showAirports);
   prefs.putString("cid", cfg.apiClientId);
   prefs.putString("csec", cfg.apiClientSecret);
   prefs.end();
@@ -425,6 +477,7 @@ void loadConfig() {
   cfg.centerLon = prefs.getFloat("clon", 2.3522f);
   cfg.radiusKm = prefs.getFloat("rad", 40.0f);
   cfg.speedCutoffKts = prefs.getFloat("spd", 200.0f);
+  cfg.showAirports = prefs.getBool("showapt", true);
   cfg.apiClientId = prefs.getString("cid", "");
   cfg.apiClientSecret = prefs.getString("csec", "");
   prefs.end();
@@ -541,6 +594,12 @@ class GenericWriteCallback : public NimBLECharacteristicCallbacks {
       } else if (cmd == "verbose off") {
         verboseLogging = false;
         publishStatus("Verbose OFF");
+      } else if (cmd == "airports on") {
+        cfg.showAirports = true;
+        publishStatus("Airports ON");
+      } else if (cmd == "airports off") {
+        cfg.showAirports = false;
+        publishStatus("Airports OFF");
       } else if (cmd == "clearwifi") {
         cfg.ssid = "";
         cfg.pass = "";
@@ -806,6 +865,32 @@ bool pointInRadarCircle(int x, int y) {
   return (dx * dx + dy * dy) <= (RADAR_RADIUS_PX * RADAR_RADIUS_PX);
 }
 
+void drawAirports(Adafruit_GFX& gfx) {
+  if (!cfg.showAirports) return;
+
+  for (size_t i = 0; i < sizeof(majorAirports) / sizeof(majorAirports[0]); i++) {
+    float dist = greatCircleKm(cfg.centerLat, cfg.centerLon, majorAirports[i].lat, majorAirports[i].lon);
+    if (dist > cfg.radiusKm) continue;
+
+    float bearing = initialBearingDeg(cfg.centerLat, cfg.centerLon, majorAirports[i].lat, majorAirports[i].lon);
+    float r = (dist / cfg.radiusKm) * RADAR_RADIUS_PX;
+    float ang = degToRad(bearing);
+    int x = CENTER_X + (int)(sinf(ang) * r);
+    int y = CENTER_Y - (int)(cosf(ang) * r);
+
+    if (!pointInRadarCircle(x, y)) continue;
+
+    uint16_t color = radarGreen(120);
+    gfx.drawLine(x - 3, y, x + 3, y, color);
+    gfx.drawLine(x, y - 3, x, y + 3, color);
+    
+    gfx.setTextColor(color);
+    gfx.setTextSize(1);
+    gfx.setCursor(x + 4, y - 4);
+    gfx.print(majorAirports[i].iata);
+  }
+}
+
 bool rectInsideRadarCircle(int x, int y, int w, int h) {
   if (x < 0 || y < 0 || x + w > SCREEN_W || y + h > SCREEN_H) return false;
   return pointInRadarCircle(x, y) &&
@@ -864,7 +949,13 @@ AdsbCacheEntry* getOrAllocateCacheEntry(const String& modeS) {
     adsbCache[idx].lookedUp = false;
     adsbCache[idx].hasRoute = false;
     adsbCache[idx].hasLabelAngle = false;
+    adsbCache[idx].color = planeColors[nextColorIdx];
+    nextColorIdx = (nextColorIdx + 1) % NUM_COLORS;
+    adsbCache[idx].trailHead = 0;
+    adsbCache[idx].trailCount = 0;
+    adsbCache[idx].lastLookupMs = 0;
   }
+  adsbCache[idx].lastSeenMs = millis();
   return &adsbCache[idx];
 }
 
@@ -891,6 +982,27 @@ bool isTargetValid(const RectRegion& cand, int myIdx, const int markerXs[], cons
   return true;
 }
 
+void drawDashedLine(Adafruit_GFX& gfx, int x0, int y0, int x1, int y1, uint16_t color, int dashLen) {
+  int dx = x1 - x0;
+  int dy = y1 - y0;
+  float dist = sqrtf(dx * dx + dy * dy);
+  if (dist <= 0) return;
+  int steps = (int)(dist / (dashLen * 2));
+  if (steps == 0) {
+    gfx.drawLine(x0, y0, x1, y1, color);
+    return;
+  }
+  float xStep = (float)dx / (steps * 2);
+  float yStep = (float)dy / (steps * 2);
+  for (int i = 0; i < steps * 2; i += 2) {
+    int startX = x0 + (int)(i * xStep);
+    int startY = y0 + (int)(i * yStep);
+    int endX = x0 + (int)((i + 1) * xStep);
+    int endY = y0 + (int)((i + 1) * yStep);
+    gfx.drawLine(startX, startY, endX, endY, color);
+  }
+}
+
 void drawThickLine(Adafruit_GFX& gfx, int x0, int y0, int x1, int y1, uint16_t color) {
   gfx.drawLine(x0, y0, x1, y1, color);
   gfx.drawLine(x0 + 1, y0, x1 + 1, y1, color);
@@ -906,6 +1018,7 @@ struct TagToDraw {
   int fl;
   int kts;
   String route;
+  uint16_t color;
 };
 
 void drawAircraft(Adafruit_GFX& gfx) {
@@ -936,14 +1049,72 @@ void drawAircraft(Adafruit_GFX& gfx) {
     markerY[i] = y;
     markerValid[i] = true;
 
-    gfx.fillCircle(x, y, 2, radarGreen(255));
-    gfx.drawCircle(x, y, 4, radarGreen(120));
+    AdsbCacheEntry* cache = getOrAllocateCacheEntry(aircraft[i].modeS);
+
+    // Add to trail if moved
+    if (cache->trailCount == 0) {
+      cache->trail[0] = {aircraft[i].lat, aircraft[i].lon};
+      cache->trailHead = 1;
+      cache->trailCount = 1;
+    } else {
+      int lastIdx = (cache->trailHead - 1 + MAX_TRAIL) % MAX_TRAIL;
+      float movedKm = greatCircleKm(cache->trail[lastIdx].lat, cache->trail[lastIdx].lon, aircraft[i].lat, aircraft[i].lon);
+      float kmPerPixel = cfg.radiusKm / (float)RADAR_RADIUS_PX;
+      
+      if (movedKm > 20.0f) {
+        // The plane jumped an enormous distance; reset the trail cache to prevent a line drawing completely across the screen
+        cache->trail[0] = {aircraft[i].lat, aircraft[i].lon};
+        cache->trailHead = 1;
+        cache->trailCount = 1;
+      } else if (movedKm > (kmPerPixel * 3.0f)) {
+        // Add a new dot in the trail only once it has moved about 3 screen pixels
+        cache->trail[cache->trailHead] = {aircraft[i].lat, aircraft[i].lon};
+        cache->trailHead = (cache->trailHead + 1) % MAX_TRAIL;
+        if (cache->trailCount < MAX_TRAIL) cache->trailCount++;
+      }
+    }
+
+    // Draw trail
+    if (cache->trailCount > 1) {
+      int prevX = -1, prevY = -1;
+      int minX = 9999, minY = 9999, maxX = -9999, maxY = -9999;
+      for (int t = 0; t < cache->trailCount; t++) {
+        int idx = (cache->trailHead - 1 - t + MAX_TRAIL) % MAX_TRAIL;
+        float tLat = cache->trail[idx].lat;
+        float tLon = cache->trail[idx].lon;
+        float tDist = greatCircleKm(cfg.centerLat, cfg.centerLon, tLat, tLon);
+        float tBear = initialBearingDeg(cfg.centerLat, cfg.centerLon, tLat, tLon);
+        float tR = (tDist / cfg.radiusKm) * RADAR_RADIUS_PX;
+        float tAng = degToRad(tBear);
+        int px = CENTER_X + (int)(sinf(tAng) * tR);
+        int py = CENTER_Y - (int)(cosf(tAng) * tR);
+        
+        if (prevX != -1 && prevY != -1) {
+          // Only connect alternating points to build a very fast dashed line
+          if (t % 2 == 1) {
+            gfx.drawLine(prevX, prevY, px, py, cache->color);
+          }
+          minX = min(minX, min(prevX, px));
+          minY = min(minY, min(prevY, py));
+          maxX = max(maxX, max(prevX, px));
+          maxY = max(maxY, max(prevY, py));
+        }
+        prevX = px;
+        prevY = py;
+      }
+      if (minX != 9999) {
+        addCurrentRegion(minX - 2, minY - 2, maxX - minX + 4, maxY - minY + 4);
+      }
+    }
+
+    gfx.fillCircle(x, y, 2, cache->color);
+    gfx.drawCircle(x, y, 4, cache->color);
     addCurrentRegion(x - 5, y - 5, 11, 11);
 
     float hdg = degToRad(aircraft[i].trackDeg);
     int hx = x + (int)(sinf(hdg) * 6.0f);
     int hy = y - (int)(cosf(hdg) * 6.0f);
-    gfx.drawLine(x, y, hx, hy, radarGreen(180));
+    gfx.drawLine(x, y, hx, hy, cache->color);
     int lx = min(x, hx) - 1;
     int ly = min(y, hy) - 1;
     addCurrentRegion(lx, ly, abs(hx - x) + 3, abs(hy - y) + 3);
@@ -1016,17 +1187,6 @@ void drawAircraft(Adafruit_GFX& gfx) {
     // Get actual drawing rect
     RectRegion curRect = getRectForAngle(cache->currentLabelAngle, x, y, tagW, tagH);
 
-    // Draw leader line (will be hidden under the label's black background box next pass)
-    int cx = curRect.x + tagW / 2;
-    int cy = curRect.y + tagH / 2;
-    drawThickLine(gfx, x, y, cx, cy, radarGreen(90));
-
-    int lx = min(x, cx) - 1;
-    int rx = max(x, cx) + 2;
-    int ty_line = min(y, cy) - 1;
-    int by_line = max(y, cy) + 2;
-    addCurrentRegion(lx, ty_line, rx - lx, by_line - ty_line);
-
     // Save to draw tags later
     tagsToDraw[tagsDrawn].tx = curRect.x;
     tagsToDraw[tagsDrawn].ty = curRect.y;
@@ -1036,6 +1196,7 @@ void drawAircraft(Adafruit_GFX& gfx) {
     tagsToDraw[tagsDrawn].fl = fl;
     tagsToDraw[tagsDrawn].kts = kts;
     tagsToDraw[tagsDrawn].route = route;
+    tagsToDraw[tagsDrawn].color = cache->color;
 
     tagsDrawn++;
   }
@@ -1044,7 +1205,7 @@ void drawAircraft(Adafruit_GFX& gfx) {
   for (int j = 0; j < tagsDrawn; j++) {
     TagToDraw& t = tagsToDraw[j];
 
-    gfx.setTextColor(radarGreen(210));
+    gfx.setTextColor(t.color);
     gfx.setCursor(t.tx, t.ty);
     gfx.print(t.cs);
 
@@ -1083,6 +1244,7 @@ void drawRadarFrame() {
     if (canvasReady) {
       canvas.fillScreen(0x0000);
       drawGrid(canvas);
+      drawAirports(canvas);
 
       currentDynamicRegionCount = 0;
       drawAircraft(canvas);
@@ -1110,6 +1272,7 @@ void drawRadarFrame() {
       // Memory allocation failed fallback
       tft.fillScreen(0x0000);
       drawGrid(tft);
+      drawAirports(tft);
       drawAircraft(tft);
       drawHud(tft);
     }
@@ -1140,6 +1303,7 @@ void setup() {
   delay(200);
   debugLog("Boot start");
 
+  setupColors();
   loadConfig();
   printConfigSummary();
   setupDisplay();

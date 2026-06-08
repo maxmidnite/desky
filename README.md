@@ -104,7 +104,10 @@ Aircraft tags include route IATA codes on a separate line (for example `FRA-AYT`
 In [src/main.cpp](src/main.cpp):
 
 - `FETCH_INTERVAL_MS` controls network fetch rate
-- `MAX_AIRCRAFT` caps rendered aircraft
+- `MAX_AIRCRAFT` caps rendered aircraft (default 40 to save memory)
+- `MAX_ADSB_CACHE` caps the number of aircraft cached for trails and routes
+- `MAX_TRAIL` caps the length of the trail behind each aircraft
+- `MAX_DYNAMIC_REGIONS` caps the number of screen regions updated per frame
 - `PIN_TFT_*` configures display pins
 
 ---
