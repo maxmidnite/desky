@@ -36,7 +36,7 @@ constexpr int MAX_ADSB_CACHE = 40;
 constexpr uint32_t ADSB_LOOKUP_SPACING_MS = 1200;
 
 // -------------------- OTA Update settings --------------------
-constexpr float CURRENT_VERSION = 0.9f;
+constexpr float CURRENT_VERSION = 0.91f;
 const char* FW_VERSION_URL = "https://raw.githubusercontent.com/maxmidnite/desky/main/release/version.json";
 const char* FW_BIN_URL = "https://raw.githubusercontent.com/maxmidnite/desky/main/release/firmware.bin";
 
@@ -50,10 +50,7 @@ struct Config {
   float centerLat;
   float centerLon;
   float radiusKm;
-  float speedCutoffKts;
   bool showAirports;
-  String apiClientId;
-  String apiClientSecret;
 };
 
 Config cfg;
@@ -195,13 +192,12 @@ static NimBLEUUID PASS_CHAR_UUID("7a0b1003-25be-45b3-8a2f-d5e9f53c1003");
 static NimBLEUUID LAT_CHAR_UUID("7a0b1004-25be-45b3-8a2f-d5e9f53c1004");
 static NimBLEUUID LON_CHAR_UUID("7a0b1005-25be-45b3-8a2f-d5e9f53c1005");
 static NimBLEUUID RADIUS_CHAR_UUID("7a0b1006-25be-45b3-8a2f-d5e9f53c1006");
-static NimBLEUUID SPEED_CHAR_UUID("7a0b1007-25be-45b3-8a2f-d5e9f53c1007");
-static NimBLEUUID CLIENT_ID_CHAR_UUID("7a0b1010-25be-45b3-8a2f-d5e9f53c1010");
-static NimBLEUUID CLIENT_SECRET_CHAR_UUID("7a0b1011-25be-45b3-8a2f-d5e9f53c1011");
 static NimBLEUUID CMD_CHAR_UUID("7a0b1008-25be-45b3-8a2f-d5e9f53c1008");
 static NimBLEUUID STATUS_CHAR_UUID("7a0b1009-25be-45b3-8a2f-d5e9f53c1009");
+static NimBLEUUID NOTES_CHAR_UUID("7a0b100a-25be-45b3-8a2f-d5e9f53c100a");
 
 NimBLECharacteristic* statusChar = nullptr;
+NimBLECharacteristic* notesChar = nullptr;
 bool verboseLogging = false;
 
 void publishStatus(const String& text);
@@ -233,9 +229,7 @@ String wifiStatusToText(wl_status_t s) {
 void printConfigSummary() {
   debugLog("Config SSID=" + (cfg.ssid.isEmpty() ? String("<empty>") : cfg.ssid));
   debugLog("Config PASS_LEN=" + String(cfg.pass.length()));
-  debugLog("Config LAT=" + String(cfg.centerLat, 5) + " LON=" + String(cfg.centerLon, 5) + " R=" + String(cfg.radiusKm, 1) + "km SPD>" + String(cfg.speedCutoffKts, 0) + "kts");
-  debugLog("Config API_CLIENT_ID=" + (cfg.apiClientId.isEmpty() ? String("<empty>") : cfg.apiClientId));
-  debugLog("Config API_CLIENT_SECRET_LEN=" + String(cfg.apiClientSecret.length()));
+  debugLog("Config LAT=" + String(cfg.centerLat, 5) + " LON=" + String(cfg.centerLon, 5) + " R=" + String(cfg.radiusKm, 1) + "km");
 }
 
 float degToRad(float d) { return d * 0.017453292519943295f; }
@@ -488,10 +482,7 @@ void saveConfig() {
   prefs.putFloat("clat", cfg.centerLat);
   prefs.putFloat("clon", cfg.centerLon);
   prefs.putFloat("rad", cfg.radiusKm);
-  prefs.putFloat("spd", cfg.speedCutoffKts);
   prefs.putBool("showapt", cfg.showAirports);
-  prefs.putString("cid", cfg.apiClientId);
-  prefs.putString("csec", cfg.apiClientSecret);
   prefs.end();
 }
 
@@ -502,14 +493,10 @@ void loadConfig() {
   cfg.centerLat = prefs.getFloat("clat", 48.8566f); // default: Paris
   cfg.centerLon = prefs.getFloat("clon", 2.3522f);
   cfg.radiusKm = prefs.getFloat("rad", 40.0f);
-  cfg.speedCutoffKts = prefs.getFloat("spd", 200.0f);
   cfg.showAirports = prefs.getBool("showapt", true);
-  cfg.apiClientId = prefs.getString("cid", "");
-  cfg.apiClientSecret = prefs.getString("csec", "");
   prefs.end();
 
   cfg.radiusKm = clampf(cfg.radiusKm, 5.0f, 150.0f);
-  cfg.speedCutoffKts = clampf(cfg.speedCutoffKts, 0.0f, 700.0f);
 }
 
 void saveAirportsToFlash() {
@@ -620,6 +607,21 @@ void connectWiFi() {
 void checkForUpdates() {
   if (WiFi.status() != WL_CONNECTED) return;
 
+  prefs.begin("radar", false);
+  float last_v = prefs.getFloat("fw_ver", 0.0f);
+  if (last_v != 0.0f && CURRENT_VERSION > last_v) {
+    tft.fillScreen(0x0000);
+    tft.setTextColor(0xFFFF);
+    tft.setTextSize(2);
+    tft.setCursor(30, CENTER_Y - 10);
+    tft.print("Updated to v" + String(CURRENT_VERSION, 1));
+    delay(2000);
+  }
+  if (last_v != CURRENT_VERSION) {
+    prefs.putFloat("fw_ver", CURRENT_VERSION);
+  }
+  prefs.end();
+
   tft.fillScreen(0x0000);
   tft.setTextColor(0xFFFF);
   tft.setTextSize(2);
@@ -641,6 +643,10 @@ void checkForUpdates() {
   // Step 1: Check version
   if (!http.begin(client, FW_VERSION_URL)) {
     debugLog("Update: HTTP begin failed");
+    tft.fillScreen(0x0000);
+    tft.setCursor(36, CENTER_Y - 10);
+    tft.print("Repo not found");
+    delay(2000);
     return;
   }
 
@@ -648,6 +654,10 @@ void checkForUpdates() {
   if (code != HTTP_CODE_OK) {
     debugLog("Update: version check failed, HTTP " + String(code));
     http.end();
+    tft.fillScreen(0x0000);
+    tft.setCursor(36, CENTER_Y - 10);
+    tft.print("Repo not found");
+    delay(2000);
     return;
   }
 
@@ -658,11 +668,20 @@ void checkForUpdates() {
   DeserializationError err = deserializeJson(doc, payload);
   if (err) {
     debugLog("Update: JSON parse failed");
+    tft.fillScreen(0x0000);
+    tft.setCursor(36, CENTER_Y - 10);
+    tft.print("Repo not found");
+    delay(2000);
     return;
   }
   
   // Grab the version, fallback to CURRENT_VERSION if the JSON is malformed
   float availableVersion = doc["version"] | CURRENT_VERSION;
+  String fetchedNotes = doc["notes"] | "No notes available";
+
+  if (notesChar) {
+    notesChar->setValue(fetchedNotes.c_str());
+  }
 
   debugLog("Current version: " + String(CURRENT_VERSION) + ", Available: " + String(availableVersion));
 
@@ -699,10 +718,10 @@ void checkForUpdates() {
     }
   } else {
     tft.fillScreen(0x0000);
-    tft.setCursor(54, CENTER_Y);
-    tft.print("Up to date!");
+    tft.setCursor(60, CENTER_Y - 10);
+    tft.print("Up to date");
     debugLog("Firmware is up to date.");
-    delay(1000);
+    delay(2000);
   }
 }
 
@@ -739,17 +758,6 @@ class GenericWriteCallback : public NimBLECharacteristicCallbacks {
     else if (key_ == "lat") cfg.centerLat = clampf(v.toFloat(), -85.0f, 85.0f);
     else if (key_ == "lon") cfg.centerLon = clampf(v.toFloat(), -180.0f, 180.0f);
     else if (key_ == "radius") cfg.radiusKm = clampf(v.toFloat(), 5.0f, 150.0f);
-    else if (key_ == "speed") cfg.speedCutoffKts = clampf(v.toFloat(), 0.0f, 700.0f);
-    else if (key_ == "client_id") {
-      cfg.apiClientId = v;
-      saveConfig();
-      publishStatus("client_id saved");
-    }
-    else if (key_ == "client_secret") {
-      cfg.apiClientSecret = v;
-      saveConfig();
-      publishStatus("client_secret saved");
-    }
     else if (key_ == "cmd") {
       String cmd = v;
       cmd.toLowerCase();
@@ -762,8 +770,6 @@ class GenericWriteCallback : public NimBLECharacteristicCallbacks {
         saveConfig();
         printConfigSummary();
         connectWiFi();
-      } else if (cmd == "auth") {
-        publishStatus("Auth not needed for ADSB.fi");
       } else if (cmd == "verbose" || cmd == "verbose on") {
         verboseLogging = true;
         publishStatus("Verbose ON");
@@ -814,23 +820,19 @@ void setupBLE() {
   auto* latChar = service->createCharacteristic(LAT_CHAR_UUID, NIMBLE_PROPERTY::WRITE);
   auto* lonChar = service->createCharacteristic(LON_CHAR_UUID, NIMBLE_PROPERTY::WRITE);
   auto* radiusChar = service->createCharacteristic(RADIUS_CHAR_UUID, NIMBLE_PROPERTY::WRITE);
-  auto* speedChar = service->createCharacteristic(SPEED_CHAR_UUID, NIMBLE_PROPERTY::WRITE);
-  auto* clientIdChar = service->createCharacteristic(CLIENT_ID_CHAR_UUID, NIMBLE_PROPERTY::WRITE);
-  auto* clientSecretChar = service->createCharacteristic(CLIENT_SECRET_CHAR_UUID, NIMBLE_PROPERTY::WRITE);
   auto* cmdChar = service->createCharacteristic(CMD_CHAR_UUID, NIMBLE_PROPERTY::WRITE);
   statusChar = service->createCharacteristic(STATUS_CHAR_UUID, NIMBLE_PROPERTY::READ | NIMBLE_PROPERTY::NOTIFY);
+  notesChar = service->createCharacteristic(NOTES_CHAR_UUID, NIMBLE_PROPERTY::READ);
 
   ssidChar->setCallbacks(new GenericWriteCallback("ssid"));
   passChar->setCallbacks(new GenericWriteCallback("pass"));
   latChar->setCallbacks(new GenericWriteCallback("lat"));
   lonChar->setCallbacks(new GenericWriteCallback("lon"));
   radiusChar->setCallbacks(new GenericWriteCallback("radius"));
-  speedChar->setCallbacks(new GenericWriteCallback("speed"));
-  clientIdChar->setCallbacks(new GenericWriteCallback("client_id"));
-  clientSecretChar->setCallbacks(new GenericWriteCallback("client_secret"));
   cmdChar->setCallbacks(new GenericWriteCallback("cmd"));
 
   statusChar->setValue("Ready");
+  notesChar->setValue("No notes yet");
 
   service->start();
 

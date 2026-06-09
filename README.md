@@ -10,6 +10,7 @@ This project turns an ESP32 + GC9A01 round TFT into a mini air-traffic radar dis
 - Draws radar scope with sweep + aircraft blips on a 240x240 circular display
 - Lets you configure Wi-Fi + radar area over BLE (Bluetooth Low Energy)
 - Saves config to ESP32 flash (NVS)
+- Auto-updates firmware over-the-air (OTA) directly from GitHub
 
 ---
 
@@ -62,17 +63,15 @@ Write UTF-8 text to characteristics:
 - Center latitude: `7a0b1004-25be-45b3-8a2f-d5e9f53c1004`
 - Center longitude: `7a0b1005-25be-45b3-8a2f-d5e9f53c1005`
 - Radius km: `7a0b1006-25be-45b3-8a2f-d5e9f53c1006`
-- Speed cutoff kts: `7a0b1007-25be-45b3-8a2f-d5e9f53c1007`
-- Client_id: `7a0b1010-25be-45b3-8a2f-d5e9f53c1010` *(Legacy/Ignored)*
-- Client_secret: `7a0b1011-25be-45b3-8a2f-d5e9f53c1011` *(Legacy/Ignored for ADSB.fi)*
+- Custom aircraft types: `7a0b1007-25be-45b3-8a2f-d5e9f53c1007`
 - Command: `7a0b1008-25be-45b3-8a2f-d5e9f53c1008`
 - Status (read/notify): `7a0b1009-25be-45b3-8a2f-d5e9f53c1009`
+- Release notes (read): `7a0b100a-25be-45b3-8a2f-d5e9f53c100a`
 
 Command values:
 
 - `save` -> save settings
 - `apply` -> save + reconnect Wi-Fi immediately
-- `auth` -> *(Legacy)* replies that auth is not needed for ADSB.fi
 - `verbose` or `verbose on` -> very talky debug logs (full API payloads)
 - `verbose off` -> normal debug logs
 - `airports on` -> turns on airport drawing (default)
@@ -84,7 +83,7 @@ Typical first-time setup:
 
 1. Write SSID
 2. Write password
-3. Write latitude/longitude/radius/speed cutoff
+3. Write latitude/longitude/radius
 4. Write command `apply`
 5. Read status characteristic
 
@@ -123,6 +122,17 @@ In [src/main.cpp](src/main.cpp):
 
 ---
 
-## 7) Legal note
+## 7) OTA Auto-Updates
+
+The project includes a built-in Over-The-Air (OTA) update mechanism. On every boot, the ESP32 connects to GitHub to check for a new firmware version.
+
+- It reads the `version.json` file hosted in the `/release/` directory of the `main` branch.
+- If the version number is higher than the `CURRENT_VERSION` hardcoded in `main.cpp`, it will automatically download `firmware.bin` and flash itself.
+- The circular TFT display shows the current version and update progress during boot.
+- **Automated Building:** The `platformio.ini` is configured with a post-build script (`copy_firmware.py`) that automatically copies the compiled `firmware.bin` to the `/release/` folder when you build the project. To push an update to your radar, just build the code, increment the version in `release/version.json`, and commit/push the `/release/` folder to GitHub.
+
+---
+
+## 8) Legal note
 
 ADSB.fi open data usage is subject to their community terms and guidelines.
