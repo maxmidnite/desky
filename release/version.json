@@ -1,4 +1,4 @@
 {
-  "version": 0.91,
+  "version": "0.9.1",
   "notes": "Minor improvements, removal of legacy authentication"
 }

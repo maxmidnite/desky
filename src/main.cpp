@@ -36,7 +36,7 @@ constexpr int MAX_ADSB_CACHE = 40;
 constexpr uint32_t ADSB_LOOKUP_SPACING_MS = 1200;
 
 // -------------------- OTA Update settings --------------------
-constexpr float CURRENT_VERSION = 0.91f;
+constexpr const char* CURRENT_VERSION = "0.9.1";
 const char* FW_VERSION_URL = "https://raw.githubusercontent.com/maxmidnite/desky/main/release/version.json";
 const char* FW_BIN_URL = "https://raw.githubusercontent.com/maxmidnite/desky/main/release/firmware.bin";
 
@@ -608,25 +608,25 @@ void checkForUpdates() {
   if (WiFi.status() != WL_CONNECTED) return;
 
   prefs.begin("radar", false);
-  float last_v = prefs.getFloat("fw_ver", 0.0f);
-  if (last_v != 0.0f && CURRENT_VERSION > last_v) {
+  String last_v = prefs.getString("fw_vstr", "");
+  if (last_v != "" && last_v != CURRENT_VERSION) {
     tft.fillScreen(0x0000);
     tft.setTextColor(0xFFFF);
     tft.setTextSize(2);
-    tft.setCursor(30, CENTER_Y - 10);
-    tft.print("Updated to v" + String(CURRENT_VERSION, 1));
+    tft.setCursor(18, CENTER_Y - 10);
+    tft.print("Updated to v" + String(CURRENT_VERSION));
     delay(2000);
   }
   if (last_v != CURRENT_VERSION) {
-    prefs.putFloat("fw_ver", CURRENT_VERSION);
+    prefs.putString("fw_vstr", CURRENT_VERSION);
   }
   prefs.end();
 
   tft.fillScreen(0x0000);
   tft.setTextColor(0xFFFF);
   tft.setTextSize(2);
-  tft.setCursor(96, CENTER_Y - 20);
-  tft.print("v" + String(CURRENT_VERSION, 1));
+  tft.setCursor(84, CENTER_Y - 20);
+  tft.print("v" + String(CURRENT_VERSION));
   tft.setCursor(54, CENTER_Y + 10);
   tft.print("Checking...");
 
@@ -676,20 +676,23 @@ void checkForUpdates() {
   }
   
   // Grab the version, fallback to CURRENT_VERSION if the JSON is malformed
-  float availableVersion = doc["version"] | CURRENT_VERSION;
+  String availableVersion = CURRENT_VERSION;
+  if (doc.containsKey("version")) {
+    availableVersion = doc["version"].as<String>();
+  }
   String fetchedNotes = doc["notes"] | "No notes available";
 
   if (notesChar) {
     notesChar->setValue(fetchedNotes.c_str());
   }
 
-  debugLog("Current version: " + String(CURRENT_VERSION) + ", Available: " + String(availableVersion));
+  debugLog("Current version: " + String(CURRENT_VERSION) + ", Available: " + availableVersion);
 
   // Step 2: Download and apply update if needed
-  if (availableVersion > CURRENT_VERSION) {
+  if (availableVersion != CURRENT_VERSION) {
     tft.fillScreen(0x0000);
-    tft.setCursor(66, CENTER_Y - 20);
-    tft.print("New: v" + String(availableVersion, 1));
+    tft.setCursor(54, CENTER_Y - 20);
+    tft.print("New: v" + availableVersion);
     tft.setCursor(54, CENTER_Y + 10);
     tft.print("Updating...");
 
