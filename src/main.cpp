@@ -2,6 +2,7 @@
 #include <WiFi.h>
 #include <WiFiClientSecure.h>
 #include <HTTPClient.h>
+#include <HTTPUpdate.h>
 #include <ArduinoJson.h>
 #include <Preferences.h>
 #include <NimBLEDevice.h>
@@ -29,9 +30,15 @@ constexpr int RADAR_RADIUS_PX = 108;
 constexpr uint32_t FETCH_INTERVAL_MS = 1500;
 constexpr uint32_t BLIP_REFRESH_INTERVAL_MS = 1500;
 constexpr int MAX_AIRCRAFT = 40;
+constexpr int MAX_AIRPORTS = 20;
 constexpr int MAX_TAGS_ON_SCREEN = 18;
 constexpr int MAX_ADSB_CACHE = 40;
 constexpr uint32_t ADSB_LOOKUP_SPACING_MS = 1200;
+
+// -------------------- OTA Update settings --------------------
+constexpr float CURRENT_VERSION = 0.9f;
+const char* FW_VERSION_URL = "https://raw.githubusercontent.com/maxmidnite/desky/main/release/version.json";
+const char* FW_BIN_URL = "https://raw.githubusercontent.com/maxmidnite/desky/main/release/firmware.bin";
 
 Adafruit_GC9A01A tft(PIN_TFT_CS, PIN_TFT_DC, PIN_TFT_RST);
 GFXcanvas16 canvas(SCREEN_W, SCREEN_H);
@@ -63,11 +70,22 @@ struct Aircraft {
   float altitudeM;
 };
 
-struct Airport {
-  const char* iata;
+struct DynamicAirport {
+  char iata[5]; // 4 chars + null terminator for safety
   float lat;
   float lon;
 };
+
+struct AirportCache {
+  int count;
+  DynamicAirport airports[MAX_AIRPORTS];
+  float savedLat;
+  float savedLon;
+  float savedRad;
+};
+
+DynamicAirport cachedAirports[MAX_AIRPORTS];
+int cachedAirportCount = 0;
 
 Aircraft aircraft[MAX_AIRCRAFT];
 int aircraftCount = 0;
@@ -138,6 +156,16 @@ struct AdsbCacheEntry {
 
 AdsbCacheEntry adsbCache[MAX_ADSB_CACHE];
 
+void initAdsbCache() {
+  for (int i = 0; i < MAX_ADSB_CACHE; i++) {
+    adsbCache[i].used = false;
+    adsbCache[i].modeS = "";
+    adsbCache[i].routeIata = "";
+    adsbCache[i].lookedUp = false;
+    adsbCache[i].hasRoute = false;
+  }
+}
+
 struct RectRegion {
   int16_t x;
   int16_t y;
@@ -151,11 +179,9 @@ int prevDynamicRegionCount = 0;
 RectRegion currentDynamicRegions[MAX_DYNAMIC_REGIONS];
 int currentDynamicRegionCount = 0;
 
-const Airport majorAirports[] = {
-  {"LHR", 51.4700, -0.4543}, {"CDG", 49.0097, 2.5479}, {"FRA", 50.0379, 8.5622},
-  {"AMS", 52.3105, 4.7683},  {"JFK", 40.6413, -73.7781}, {"LAX", 33.9416, -118.4085},
-  {"HND", 35.5494, 139.7798}, {"DXB", 25.2532, 55.3657}, {"SIN", 1.3644, 103.9915}
-};
+float lastAptLat = -999.0f;
+float lastAptLon = -999.0f;
+float lastAptRad = -1.0f;
 
 void addCurrentRegion(int x, int y, int w, int h) {
   if (currentDynamicRegionCount >= MAX_DYNAMIC_REGIONS) return;
@@ -486,6 +512,67 @@ void loadConfig() {
   cfg.speedCutoffKts = clampf(cfg.speedCutoffKts, 0.0f, 700.0f);
 }
 
+void saveAirportsToFlash() {
+  if (cachedAirportCount <= 0) return;
+
+  AirportCache cache;
+  cache.count = cachedAirportCount;
+  cache.savedLat = lastAptLat;
+  cache.savedLon = lastAptLon;
+  cache.savedRad = lastAptRad;
+  memcpy(cache.airports, cachedAirports, sizeof(DynamicAirport) * cachedAirportCount);
+
+  prefs.begin("radar", false);
+  size_t written = prefs.putBytes("aptcache", &cache, sizeof(cache));
+  prefs.end();
+
+  if (written == sizeof(cache)) {
+    debugLog("Airport cache saved to flash.");
+  } else {
+    debugLog("Failed to save airport cache to flash.");
+  }
+}
+
+void loadAirportsFromFlash() {
+  prefs.begin("radar", true);
+  if (!prefs.isKey("aptcache")) {
+    prefs.end();
+    debugLog("No airport cache found in flash.");
+    return;
+  }
+
+  AirportCache cache;
+  size_t read = prefs.getBytes("aptcache", &cache, sizeof(cache));
+  prefs.end();
+
+  if (read != sizeof(cache)) {
+    debugLog("Airport cache in flash is corrupt/wrong size.");
+    return;
+  }
+
+  // Check if the cache is for the current area
+  float latDiff = fabsf(cache.savedLat - cfg.centerLat);
+  float lonDiff = fabsf(cache.savedLon - cfg.centerLon);
+  float radDiff = fabsf(cache.savedRad - cfg.radiusKm);
+
+  if (latDiff < 0.01f && lonDiff < 0.01f && radDiff < 1.0f) {
+    cachedAirportCount = cache.count;
+    if (cachedAirportCount > MAX_AIRPORTS) cachedAirportCount = MAX_AIRPORTS; // sanity check
+    if (cachedAirportCount > 0) {
+      memcpy(cachedAirports, cache.airports, sizeof(DynamicAirport) * cachedAirportCount);
+    }
+    
+    lastAptLat = cache.savedLat;
+    lastAptLon = cache.savedLon;
+    lastAptRad = cache.savedRad;
+
+    debugLog("Loaded " + String(cachedAirportCount) + " airports from flash cache.");
+    dynamicDirty = true;
+  } else {
+    debugLog("Airport cache in flash is for a different area. Ignoring.");
+  }
+}
+
 void publishStatus(const String& text) {
   lastStatusText = text;
   if (statusChar) {
@@ -527,6 +614,95 @@ void connectWiFi() {
   } else {
     debugLog("WiFi final status=" + wifiStatusToText(WiFi.status()));
     publishStatus("WiFi failed");
+  }
+}
+
+void checkForUpdates() {
+  if (WiFi.status() != WL_CONNECTED) return;
+
+  tft.fillScreen(0x0000);
+  tft.setTextColor(0xFFFF);
+  tft.setTextSize(2);
+  tft.setCursor(96, CENTER_Y - 20);
+  tft.print("v" + String(CURRENT_VERSION, 1));
+  tft.setCursor(54, CENTER_Y + 10);
+  tft.print("Checking...");
+
+  publishStatus("Checking updates...");
+  debugLog("Checking for updates at: " + String(FW_VERSION_URL));
+
+  WiFiClientSecure client;
+  client.setInsecure(); // GitHub raw requires HTTPS
+
+  HTTPClient http;
+  http.setConnectTimeout(5000);
+  http.setTimeout(5000);
+
+  // Step 1: Check version
+  if (!http.begin(client, FW_VERSION_URL)) {
+    debugLog("Update: HTTP begin failed");
+    return;
+  }
+
+  int code = http.GET();
+  if (code != HTTP_CODE_OK) {
+    debugLog("Update: version check failed, HTTP " + String(code));
+    http.end();
+    return;
+  }
+
+  String payload = http.getString();
+  http.end();
+
+  JsonDocument doc;
+  DeserializationError err = deserializeJson(doc, payload);
+  if (err) {
+    debugLog("Update: JSON parse failed");
+    return;
+  }
+  
+  // Grab the version, fallback to CURRENT_VERSION if the JSON is malformed
+  float availableVersion = doc["version"] | CURRENT_VERSION;
+
+  debugLog("Current version: " + String(CURRENT_VERSION) + ", Available: " + String(availableVersion));
+
+  // Step 2: Download and apply update if needed
+  if (availableVersion > CURRENT_VERSION) {
+    tft.fillScreen(0x0000);
+    tft.setCursor(66, CENTER_Y - 20);
+    tft.print("New: v" + String(availableVersion, 1));
+    tft.setCursor(54, CENTER_Y + 10);
+    tft.print("Updating...");
+
+    publishStatus("Updating fw...");
+    debugLog("New version found! Starting OTA update from: " + String(FW_BIN_URL));
+    
+    // This will stream the .bin directly to flash and automatically reboot if successful.
+    t_httpUpdate_return ret = httpUpdate.update(client, FW_BIN_URL);
+
+    tft.fillScreen(0x0000);
+    tft.setCursor(42, CENTER_Y);
+    switch (ret) {
+      case HTTP_UPDATE_FAILED:
+        debugLog("Update failed: " + httpUpdate.getLastErrorString());
+        publishStatus("OTA Failed");
+        tft.print("Update Failed");
+        delay(2000);
+        break;
+      case HTTP_UPDATE_NO_UPDATES:
+        debugLog("Update no updates.");
+        break;
+      case HTTP_UPDATE_OK:
+        // Normally won't be reached because of auto-reboot
+        debugLog("Update OK."); 
+        break;
+    }
+  } else {
+    tft.fillScreen(0x0000);
+    tft.setCursor(54, CENTER_Y);
+    tft.print("Up to date!");
+    debugLog("Firmware is up to date.");
+    delay(1000);
   }
 }
 
@@ -865,14 +1041,88 @@ bool pointInRadarCircle(int x, int y) {
   return (dx * dx + dy * dy) <= (RADAR_RADIUS_PX * RADAR_RADIUS_PX);
 }
 
+bool updateAirportsIfMoved() {
+  if (!cfg.showAirports) return false;
+  if (WiFi.status() != WL_CONNECTED) return false;
+
+  // Check if we moved enough to warrant an update (1km distance or radius change)
+  float distMoved = greatCircleKm(lastAptLat, lastAptLon, cfg.centerLat, cfg.centerLon);
+  if (distMoved < 1.0f && fabsf(lastAptRad - cfg.radiusKm) < 1.0f) {
+    return false;
+  }
+
+  // Use OpenStreetMap Overpass API - 100% free, no API key needed
+  String query = "[out:json];nwr[\"aeroway\"=\"aerodrome\"][\"iata\"](around:" + 
+                 String(cfg.radiusKm * 1000.0f, 0) + "," + 
+                 String(cfg.centerLat, 5) + "," + String(cfg.centerLon, 5) + ");out center;";
+  String url = "https://overpass-api.de/api/interpreter?data=" + urlEncode(query);
+
+  debugLog("Overpass API GET " + url);
+
+  WiFiClientSecure client;
+  client.setInsecure();
+  HTTPClient http;
+  http.setConnectTimeout(4000);
+  http.setTimeout(6000); // Overpass can sometimes take a moment
+  
+  if (!http.begin(client, url)) return false;
+  http.addHeader("User-Agent", "DeskRadar-ESP32");
+
+  int code = http.GET();
+  if (code != HTTP_CODE_OK) {
+    debugLog("Overpass API HTTP " + String(code));
+    http.end();
+    return false;
+  }
+
+  String payload = http.getString();
+  http.end();
+
+#if ARDUINOJSON_VERSION_MAJOR == 6
+  DynamicJsonDocument doc(8192);
+#else
+  JsonDocument doc;
+#endif
+  DeserializationError err = deserializeJson(doc, payload);
+  if (err) {
+    debugLog("Airports JSON err: " + String(err.c_str()));
+    return false;
+  }
+
+  JsonArray arr = doc["elements"].as<JsonArray>();
+  if (arr.isNull()) return false;
+
+  cachedAirportCount = 0;
+  for (JsonVariant v : arr) {
+    if (cachedAirportCount >= MAX_AIRPORTS) break;
+    
+    String iataStr = v["tags"]["iata"].isNull() ? "" : v["tags"]["iata"].as<String>();
+    if (iataStr.isEmpty() || iataStr.length() > 4) continue; // Skip small airstrips or invalid IATA
+    
+    memset(cachedAirports[cachedAirportCount].iata, 0, 5);
+    strncpy(cachedAirports[cachedAirportCount].iata, iataStr.c_str(), 4);
+    // Nodes have "lat"/"lon", Ways/Relations have "center"
+    cachedAirports[cachedAirportCount].lat = v["lat"].isNull() ? v["center"]["lat"].as<float>() : v["lat"].as<float>();
+    cachedAirports[cachedAirportCount].lon = v["lon"].isNull() ? v["center"]["lon"].as<float>() : v["lon"].as<float>();
+    cachedAirportCount++;
+  }
+
+  lastAptLat = cfg.centerLat;
+  lastAptLon = cfg.centerLon;
+  lastAptRad = cfg.radiusKm;
+  debugLog("Updated local airports cache: " + String(cachedAirportCount));
+  saveAirportsToFlash();
+  return true;
+}
+
 void drawAirports(Adafruit_GFX& gfx) {
   if (!cfg.showAirports) return;
 
-  for (size_t i = 0; i < sizeof(majorAirports) / sizeof(majorAirports[0]); i++) {
-    float dist = greatCircleKm(cfg.centerLat, cfg.centerLon, majorAirports[i].lat, majorAirports[i].lon);
+  for (int i = 0; i < cachedAirportCount; i++) {
+    float dist = greatCircleKm(cfg.centerLat, cfg.centerLon, cachedAirports[i].lat, cachedAirports[i].lon);
     if (dist > cfg.radiusKm) continue;
 
-    float bearing = initialBearingDeg(cfg.centerLat, cfg.centerLon, majorAirports[i].lat, majorAirports[i].lon);
+    float bearing = initialBearingDeg(cfg.centerLat, cfg.centerLon, cachedAirports[i].lat, cachedAirports[i].lon);
     float r = (dist / cfg.radiusKm) * RADAR_RADIUS_PX;
     float ang = degToRad(bearing);
     int x = CENTER_X + (int)(sinf(ang) * r);
@@ -887,7 +1137,7 @@ void drawAirports(Adafruit_GFX& gfx) {
     gfx.setTextColor(color);
     gfx.setTextSize(1);
     gfx.setCursor(x + 4, y - 4);
-    gfx.print(majorAirports[i].iata);
+    gfx.print(cachedAirports[i].iata);
   }
 }
 
@@ -1112,8 +1362,8 @@ void drawAircraft(Adafruit_GFX& gfx) {
     addCurrentRegion(x - 5, y - 5, 11, 11);
 
     float hdg = degToRad(aircraft[i].trackDeg);
-    int hx = x + (int)(sinf(hdg) * 6.0f);
-    int hy = y - (int)(cosf(hdg) * 6.0f);
+    int hx = x + (int)(sinf(hdg) * 9.0f);
+    int hy = y - (int)(cosf(hdg) * 9.0f);
     gfx.drawLine(x, y, hx, hy, cache->color);
     int lx = min(x, hx) - 1;
     int ly = min(y, hy) - 1;
@@ -1149,7 +1399,13 @@ void drawAircraft(Adafruit_GFX& gfx) {
     route.trim();
     bool hasRoute = !route.isEmpty();
 
-    int tagW = 104;
+    // Dynamically calculate the widest line of text (Adafruit GFX default font is 6px per char)
+    String line2 = "FL" + String(fl) + " " + String(kts);
+    int maxChars = cs.length();
+    if (line2.length() > maxChars) maxChars = line2.length();
+    if (hasRoute && route.length() > maxChars) maxChars = route.length();
+    
+    int tagW = maxChars * 6;
     int tagH = hasRoute ? 27 : 18;
 
     // Find best target angle
@@ -1291,9 +1547,12 @@ void setupDisplay() {
   tft.begin();
   tft.setRotation(0);
   tft.fillScreen(0x0000);
+  tft.setTextWrap(false);
 
   canvasReady = (canvas.getBuffer() != nullptr);
-  if (!canvasReady) {
+  if (canvasReady) {
+    canvas.setTextWrap(false);
+  } else {
     Serial.println("[WARN] Framebuffer alloc failed, using direct mode");
   }
 }
@@ -1303,18 +1562,34 @@ void setup() {
   delay(200);
   debugLog("Boot start");
 
+  initAdsbCache();
   setupColors();
   loadConfig();
+  loadAirportsFromFlash();
   printConfigSummary();
   setupDisplay();
   setupBLE();
 
   connectWiFi();
+
+  checkForUpdates();
   // Fetch from ADSB.fi on boot
   if (fetchAdsbFi()) {
     dynamicDirty = true;
   }
+  if (updateAirportsIfMoved()) {
+    dynamicDirty = true;
+  }
   drawRadarFrame();
+}
+
+void cleanAdsbCache() {
+  uint32_t now = millis();
+  for (int i = 0; i < MAX_ADSB_CACHE; i++) {
+    if (adsbCache[i].used && (now - adsbCache[i].lastSeenMs > 60000UL)) {
+      adsbCache[i].used = false; // Plane left area or API stopped tracking it
+    }
+  }
 }
 
 void loop() {
@@ -1323,6 +1598,9 @@ void loop() {
   if (now - lastFetchMs > FETCH_INTERVAL_MS) {
     lastFetchMs = now;
     if (fetchAdsbFi()) {
+      dynamicDirty = true;
+    }
+    if (updateAirportsIfMoved()) {
       dynamicDirty = true;
     }
   }
@@ -1336,6 +1614,8 @@ void loop() {
     lastAdsbLookupMs = now;
     lookupOnePendingAdsbdbRoute();
   }
+
+  cleanAdsbCache();
 
   drawRadarFrame();
 

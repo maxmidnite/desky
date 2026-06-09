@@ -6,6 +6,7 @@ This project turns an ESP32 + GC9A01 round TFT into a mini air-traffic radar dis
 
 - Connects to Wi-Fi
 - Pulls nearby aircraft from the free ADSB.fi API
+- Dynamically fetches nearby airports using the OpenStreetMap Overpass API
 - Draws radar scope with sweep + aircraft blips on a 240x240 circular display
 - Lets you configure Wi-Fi + radar area over BLE (Bluetooth Low Energy)
 - Saves config to ESP32 flash (NVS)
@@ -62,7 +63,7 @@ Write UTF-8 text to characteristics:
 - Center longitude: `7a0b1005-25be-45b3-8a2f-d5e9f53c1005`
 - Radius km: `7a0b1006-25be-45b3-8a2f-d5e9f53c1006`
 - Speed cutoff kts: `7a0b1007-25be-45b3-8a2f-d5e9f53c1007`
-- Client_id: `7a0b1010-25be-45b3-8a2f-d5e9f53c1010` *(Legacy/Ignored for ADSB.fi)*
+- Client_id: `7a0b1010-25be-45b3-8a2f-d5e9f53c1010` *(Legacy/Ignored)*
 - Client_secret: `7a0b1011-25be-45b3-8a2f-d5e9f53c1011` *(Legacy/Ignored for ADSB.fi)*
 - Command: `7a0b1008-25be-45b3-8a2f-d5e9f53c1008`
 - Status (read/notify): `7a0b1009-25be-45b3-8a2f-d5e9f53c1009`
@@ -74,6 +75,8 @@ Command values:
 - `auth` -> *(Legacy)* replies that auth is not needed for ADSB.fi
 - `verbose` or `verbose on` -> very talky debug logs (full API payloads)
 - `verbose off` -> normal debug logs
+- `airports on` -> turns on airport drawing (default)
+- `airports off` -> turns off airport drawing
 - `clearwifi` -> erase Wi-Fi creds
 - `reboot` -> restart ESP32
 
@@ -99,7 +102,15 @@ Aircraft tags include route IATA codes on a separate line (for example `FRA-AYT`
 
 ---
 
-## 5) Tuning
+## 5) Dynamic Airports (OpenStreetMap)
+
+The radar dynamically fetches nearby airports based on your configured coordinates and radius using the free **OpenStreetMap Overpass API**. No API key is required.
+
+The radar caches the local airports in memory to save bandwidth. It will only call the API again if you change your radar radius, or if your center coordinates move by more than 1 kilometer.
+
+---
+
+## 6) Tuning
 
 In [src/main.cpp](src/main.cpp):
 
@@ -112,6 +123,6 @@ In [src/main.cpp](src/main.cpp):
 
 ---
 
-## 6) Legal note
+## 7) Legal note
 
 ADSB.fi open data usage is subject to their community terms and guidelines.
